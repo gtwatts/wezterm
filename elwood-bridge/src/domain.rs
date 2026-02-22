@@ -238,8 +238,23 @@ async fn agent_runtime_loop(
                 // Fresh cancellation token for new turn
                 cancel = CancellationToken::new();
 
+                // Collect git context and prepend to first message of each turn
+                let enriched = {
+                    let cwd = std::env::current_dir()
+                        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                    let git_ctx = crate::git_info::get_git_context(&cwd);
+                    if git_ctx.branch.is_empty() {
+                        content.clone()
+                    } else {
+                        format!(
+                            "[Git Context]\n{}\n[User Message]\n{content}",
+                            git_ctx.format_context()
+                        )
+                    }
+                };
+
                 // Append user message to ongoing conversation
-                messages.push(Message::user(&content));
+                messages.push(Message::user(&enriched));
 
                 run_agent_turn(
                     &config,
@@ -305,6 +320,16 @@ async fn agent_runtime_loop(
             AgentRequest::PermissionResponse { .. } => {
                 // Permission handling will be wired when ToolRegistry
                 // permission handler is integrated
+            }
+
+            AgentRequest::ReviewFeedback { .. } => {
+                // Review feedback is handled on the WezTerm side (diff viewer)
+            }
+
+            AgentRequest::PtyWrite { .. } | AgentRequest::PtyReadScreen => {
+                // PTY interactions are handled on the WezTerm/pane side,
+                // not in the agent loop. These should not normally arrive here.
+                tracing::debug!("PTY request received in agent loop (ignored)");
             }
 
             AgentRequest::Shutdown => {

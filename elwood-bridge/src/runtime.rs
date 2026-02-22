@@ -50,8 +50,29 @@ pub enum AgentRequest {
     /// User responded to a permission request.
     PermissionResponse { request_id: String, granted: bool },
 
+    /// User reviewed a proposed file edit (from diff viewer).
+    ReviewFeedback {
+        /// Path of the file being reviewed.
+        file_path: String,
+        /// Inline comments: (file, line_number, comment_text).
+        comments: Vec<(String, usize, String)>,
+        /// Whether the user approved the changes.
+        approved: bool,
+    },
+
     /// Cancel the current agent operation.
     Cancel,
+
+    /// Agent wants to write keystrokes/text to the PTY.
+    PtyWrite {
+        /// The text to send to PTY stdin.
+        input: String,
+        /// Human-readable description of what the agent is doing.
+        description: String,
+    },
+
+    /// Agent requests a screen snapshot from the PTY.
+    PtyReadScreen,
 
     /// Gracefully shut down the agent runtime.
     Shutdown,
@@ -96,6 +117,28 @@ pub enum AgentResponse {
         stdout: String,
         stderr: String,
         exit_code: Option<i32>,
+    },
+
+    /// Agent proposes a file edit, shown as an interactive diff.
+    FileEdit {
+        /// Path to the file being edited.
+        file_path: String,
+        /// Original file content.
+        old_content: String,
+        /// Proposed new file content.
+        new_content: String,
+        /// Human-readable description of the edit.
+        description: String,
+    },
+
+    /// Screen snapshot from the PTY terminal.
+    PtyScreenSnapshot {
+        lines: Vec<String>,
+        cursor_x: usize,
+        cursor_y: i64,
+        cols: usize,
+        rows: usize,
+        alt_screen: bool,
     },
 
     /// An error occurred in the agent.

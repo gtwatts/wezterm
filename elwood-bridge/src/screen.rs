@@ -24,6 +24,7 @@
 //! └──────────────────────────────────────────────────┘  Row H-1
 //! ```
 
+use crate::git_info::GitInfo;
 use crate::runtime::InputMode;
 use std::time::Instant;
 
@@ -147,6 +148,10 @@ pub struct ScreenState {
     pub is_running: bool,
     /// True when awaiting permission.
     pub awaiting_permission: bool,
+    /// Current git repository info (branch, dirty state, ahead/behind).
+    pub git_info: Option<GitInfo>,
+    /// Ghost text suggestion (dim suffix shown after input cursor).
+    pub ghost_text: Option<String>,
 }
 
 impl Default for ScreenState {
@@ -176,6 +181,8 @@ impl Default for ScreenState {
             input_mode: InputMode::default(),
             is_running: false,
             awaiting_permission: false,
+            git_info: None,
+            ghost_text: None,
         }
     }
 }
@@ -459,7 +466,7 @@ pub fn render_input_box(state: &ScreenState) -> String {
             ));
         }
     } else {
-        // Single-line: show text or placeholder
+        // Single-line: show text or placeholder, with optional ghost text
         out.push_str(&goto(top + 1, 1));
         let use_text = if state.input_lines.is_empty() {
             &state.input_text
@@ -475,12 +482,26 @@ pub fn render_input_box(state: &ScreenState) -> String {
             ));
         } else {
             let display: String = use_text.chars().take(inner_w).collect();
-            let pad = inner_w.saturating_sub(display.chars().count());
+            let display_len = display.chars().count();
+
+            // Render ghost text (dim+italic) after the typed text
+            let ghost_suffix = state.ghost_text.as_deref().unwrap_or("");
+            let ghost_available = inner_w.saturating_sub(display_len);
+            let ghost_display: String = ghost_suffix.chars().take(ghost_available).collect();
+            let ghost_len = ghost_display.chars().count();
+
+            let pad = inner_w.saturating_sub(display_len + ghost_len);
             out.push_str(&format!(
-                "{border}{BOX_V}{r} {}{display}{}",
+                "{border}{BOX_V}{r} {}{display}",
                 fgc(FG),
-                " ".repeat(pad),
             ));
+            if !ghost_display.is_empty() {
+                out.push_str(&format!(
+                    "{}{DIM}{ITALIC}{ghost_display}{r}",
+                    fgc(MUTED),
+                ));
+            }
+            out.push_str(&" ".repeat(pad));
         }
         out.push_str(&format!(" {border}{BOX_V}{r}"));
     }
@@ -520,9 +541,34 @@ pub fn render_status_bar(state: &ScreenState) -> String {
     let mode_bg = bgc(mode_color);
     let mode_fg = fg(BG.0, BG.1, BG.2);
 
+    // Git branch pill
+    let git_str = if let Some(ref gi) = state.git_info {
+        let git_fg = fgc(MUTED);
+        let branch_fg = fgc(INFO);
+        let dirty_fg = fgc(WARNING);
+        let dirty_mark = if gi.is_dirty {
+            format!("{dirty_fg}*{RESET}{sbg}")
+        } else {
+            String::new()
+        };
+        let mut ab = String::new();
+        if gi.ahead > 0 {
+            ab.push_str(&format!(" {}{}\u{2191}{}{RESET}{sbg}", fgc(SUCCESS), "", gi.ahead));
+        }
+        if gi.behind > 0 {
+            ab.push_str(&format!(" {}{}\u{2193}{}{RESET}{sbg}", fgc(ERROR), "", gi.behind));
+        }
+        format!(
+            "  {git_fg}\u{E0A0}{RESET}{sbg} {branch_fg}{}{RESET}{sbg}{dirty_mark}{ab}",
+            gi.branch,
+        )
+    } else {
+        String::new()
+    };
+
     out.push_str(&goto(row, 1));
     out.push_str(&format!(
-        "{sbg} {mode_bg}{mode_fg}{BOLD}{mode_label}{RESET}{sbg}  \
+        "{sbg} {mode_bg}{mode_fg}{BOLD}{mode_label}{RESET}{sbg}{git_str}  \
          {key_bg}{key_fg}{BOLD} /help {RESET}{sbg} {label_fg}cmds{RESET}{sbg}  \
          {key_bg}{key_fg}{BOLD} ^C {RESET}{sbg} {label_fg}quit{RESET}{sbg}  \
          {key_bg}{key_fg}{BOLD} ^T {RESET}{sbg} {label_fg}mode{RESET}{sbg}",
@@ -873,6 +919,21 @@ pub fn format_prompt() -> String {
     let accent = fgc(ACCENT);
     let muted = fgc(MUTED);
     format!("\r\n{accent}{BOLD}elwood{RESET} {muted}{ARROW}{RESET} ")
+}
+
+/// Format a slash command response (informational text block).
+///
+/// Used to render the output of commands like `/help`, `/model`, `/diff`.
+pub fn format_command_response(text: &str) -> String {
+    let muted = fgc(MUTED);
+    let fg_main = fgc(FG);
+    let mut out = String::new();
+    out.push_str("\r\n");
+    for line in text.lines() {
+        out.push_str(&format!("  {fg_main}{line}{RESET}\r\n"));
+    }
+    out.push_str(&format!("{muted}{RESET}\r\n"));
+    out
 }
 
 /// Format a permission approval.

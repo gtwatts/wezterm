@@ -40,5 +40,12 @@ regex.workspace = true
 serde = { workspace = true, features = ["derive"] }
 toml.workspace = true
 
+# File walking (.gitignore-aware) for @ context attachments
+ignore = "0.4"
+
+# Diff engine for code review
+similar = { version = "2", features = ["inline", "unicode"] }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "macros", "test-util"] }
+tempfile = "3"

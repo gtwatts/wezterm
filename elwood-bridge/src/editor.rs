@@ -21,6 +21,19 @@ pub const MAX_INPUT_LINES: usize = 8;
 /// Maximum history entries stored per mode.
 const MAX_HISTORY: usize = 1000;
 
+/// The editor's operational state, controlling key event routing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditorState {
+    /// Normal typing. Ghost text suggestion may be visible.
+    Normal,
+    /// Command palette is open. All keys routed to palette.
+    Palette,
+    /// Fuzzy history search is open. All keys routed to search.
+    HistorySearch,
+    /// Awaiting permission approval. Only y/n/Esc accepted.
+    AwaitingPermission,
+}
+
 /// Multi-line text editor with per-mode command history.
 #[derive(Debug, Clone)]
 pub struct InputEditor {
@@ -40,6 +53,8 @@ pub struct InputEditor {
     history_index: Option<usize>,
     /// Draft saved when Up is pressed for the first time (restored on Down past end).
     history_draft: Option<Vec<String>>,
+    /// Current ghost text suggestion (the suffix after the cursor).
+    ghost_text: Option<String>,
 }
 
 impl InputEditor {
@@ -54,6 +69,7 @@ impl InputEditor {
             terminal_history: Vec::new(),
             history_index: None,
             history_draft: None,
+            ghost_text: None,
         }
     }
 
@@ -235,6 +251,67 @@ impl InputEditor {
         }
     }
 
+    // ─── Ghost Text / Suggestions ──────────────────────────────────────
+
+    /// Set the ghost text suggestion (the suffix shown dimmed after the cursor).
+    pub fn set_ghost_text(&mut self, ghost: Option<String>) {
+        self.ghost_text = ghost;
+    }
+
+    /// Get the current ghost text suggestion.
+    pub fn ghost_text(&self) -> Option<&str> {
+        self.ghost_text.as_deref()
+    }
+
+    /// Clear the ghost text suggestion.
+    pub fn clear_ghost_text(&mut self) {
+        self.ghost_text = None;
+    }
+
+    /// Accept the full ghost text suggestion, appending it to the current content.
+    ///
+    /// Returns `true` if a suggestion was accepted.
+    pub fn accept_suggestion(&mut self) -> bool {
+        if let Some(ghost) = self.ghost_text.take() {
+            // Append the ghost suffix to the current line
+            self.lines[self.cursor_row].push_str(&ghost);
+            self.cursor_col = self.lines[self.cursor_row].len();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Accept one word from the ghost text suggestion.
+    ///
+    /// Returns `true` if a word was accepted.
+    pub fn accept_next_word(&mut self) -> bool {
+        if let Some(ghost) = self.ghost_text.take() {
+            // Find the end of the next word in the ghost text
+            let word_end = next_word_end(&ghost);
+            let accepted = &ghost[..word_end];
+            let remaining = &ghost[word_end..];
+
+            self.lines[self.cursor_row].push_str(accepted);
+            self.cursor_col = self.lines[self.cursor_row].len();
+
+            if remaining.is_empty() {
+                self.ghost_text = None;
+            } else {
+                self.ghost_text = Some(remaining.to_string());
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Returns `true` if the cursor is at the end of the last line.
+    pub fn at_end_of_line(&self) -> bool {
+        self.cursor_row + 1 == self.lines.len()
+            && self.cursor_col == self.lines[self.cursor_row].len()
+    }
+
     // ─── Submit ─────────────────────────────────────────────────────────
 
     /// Return the current content and clear the buffer.
@@ -354,6 +431,7 @@ impl InputEditor {
     fn reset_history_state(&mut self) {
         self.history_index = None;
         self.history_draft = None;
+        self.ghost_text = None;
     }
 
     // ─── Internals ──────────────────────────────────────────────────────
@@ -390,6 +468,28 @@ fn next_char_boundary(s: &str, pos: usize) -> usize {
         p += 1;
     }
     p.min(s.len())
+}
+
+/// Return the byte offset of the end of the first word in `s`.
+///
+/// Skips leading whitespace, then skips non-whitespace characters.
+fn next_word_end(s: &str) -> usize {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+
+    // Skip leading whitespace
+    while i < bytes.len() && bytes[i] == b' ' {
+        i += 1;
+    }
+    // Skip word characters
+    while i < bytes.len() && bytes[i] != b' ' {
+        i += 1;
+    }
+    // If we haven't moved at all and there's content, take at least one char
+    if i == 0 && !s.is_empty() {
+        i = 1;
+    }
+    i
 }
 
 /// Return the byte offset of the start of the word before `pos` in `s`.
@@ -772,5 +872,113 @@ mod tests {
         assert_eq!(word_start_before("foo bar   ", 10), 4);
         assert_eq!(word_start_before("hello", 5), 0);
         assert_eq!(word_start_before("", 0), 0);
+    }
+
+    // ─── Ghost Text / Suggestions ──────────────────────────────────
+
+    #[test]
+    fn test_ghost_text_set_and_get() {
+        let mut e = editor();
+        assert_eq!(e.ghost_text(), None);
+        e.set_ghost_text(Some(" --workspace".to_string()));
+        assert_eq!(e.ghost_text(), Some(" --workspace"));
+    }
+
+    #[test]
+    fn test_ghost_text_cleared_on_edit() {
+        let mut e = editor();
+        e.set_ghost_text(Some(" --release".to_string()));
+        e.insert_char('a');
+        assert_eq!(e.ghost_text(), None);
+    }
+
+    #[test]
+    fn test_accept_suggestion() {
+        let mut e = editor();
+        for c in "cargo t".chars() { e.insert_char(c); }
+        e.set_ghost_text(Some("est --workspace".to_string()));
+
+        let accepted = e.accept_suggestion();
+        assert!(accepted);
+        assert_eq!(e.content(), "cargo test --workspace");
+        assert_eq!(e.ghost_text(), None);
+    }
+
+    #[test]
+    fn test_accept_suggestion_no_ghost() {
+        let mut e = editor();
+        for c in "hello".chars() { e.insert_char(c); }
+        let accepted = e.accept_suggestion();
+        assert!(!accepted);
+    }
+
+    #[test]
+    fn test_accept_next_word() {
+        let mut e = editor();
+        for c in "cargo".chars() { e.insert_char(c); }
+        e.set_ghost_text(Some(" test --workspace".to_string()));
+
+        let accepted = e.accept_next_word();
+        assert!(accepted);
+        assert_eq!(e.content(), "cargo test");
+        assert_eq!(e.ghost_text(), Some(" --workspace"));
+    }
+
+    #[test]
+    fn test_accept_next_word_last_word() {
+        let mut e = editor();
+        for c in "cargo test".chars() { e.insert_char(c); }
+        e.set_ghost_text(Some(" --workspace".to_string()));
+
+        let accepted = e.accept_next_word();
+        assert!(accepted);
+        assert_eq!(e.content(), "cargo test --workspace");
+        assert_eq!(e.ghost_text(), None);
+    }
+
+    #[test]
+    fn test_at_end_of_line() {
+        let mut e = editor();
+        assert!(e.at_end_of_line()); // empty
+
+        for c in "hello".chars() { e.insert_char(c); }
+        assert!(e.at_end_of_line());
+
+        e.move_left();
+        assert!(!e.at_end_of_line());
+    }
+
+    #[test]
+    fn test_at_end_of_line_multiline() {
+        let mut e = editor();
+        for c in "hello".chars() { e.insert_char(c); }
+        e.insert_newline();
+        for c in "world".chars() { e.insert_char(c); }
+        assert!(e.at_end_of_line());
+
+        // Move to first line — not at end of last line
+        e.cursor_row = 0;
+        e.cursor_col = 5;
+        assert!(!e.at_end_of_line());
+    }
+
+    // ─── EditorState enum ──────────────────────────────────────────
+
+    #[test]
+    fn test_editor_state_values() {
+        use super::EditorState;
+        assert_ne!(EditorState::Normal, EditorState::Palette);
+        assert_ne!(EditorState::Normal, EditorState::HistorySearch);
+        assert_ne!(EditorState::Normal, EditorState::AwaitingPermission);
+    }
+
+    // ─── next_word_end helper ──────────────────────────────────────
+
+    #[test]
+    fn test_next_word_end() {
+        assert_eq!(next_word_end(" test --workspace"), 5);
+        assert_eq!(next_word_end("test --workspace"), 4);
+        assert_eq!(next_word_end(" --workspace"), 12);
+        assert_eq!(next_word_end(""), 0);
     }
 }

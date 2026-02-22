@@ -34,10 +34,22 @@
 //! use cursor save/restore to avoid disturbing the scroll position.
 
 use crate::block::BlockManager;
+use crate::commands::{self, CommandResult};
+use crate::completions::CompletionEngine;
+use crate::context;
+use crate::diff;
+use crate::diff_viewer::{DiffViewer, ReviewAction};
 use crate::editor::InputEditor;
+use crate::git_info;
+use crate::history_search::{HistoryRecord, HistorySearch};
+use crate::nl_classifier::NlClassifier;
 use crate::observer::{ContentDetector, ContentType, NextCommandSuggester};
+use crate::palette::CommandPalette;
+use crate::pty_inner::InnerPty;
 use crate::runtime::{AgentRequest, AgentResponse, InputMode, RuntimeBridge};
 use crate::screen::{self, ScreenState};
+use crate::session_log::SessionLog;
+use crate::shared_writer::SharedWriter;
 
 use async_trait::async_trait;
 use mux::domain::DomainId;
@@ -52,10 +64,12 @@ use mux::renderable::{
     StableCursorPosition,
 };
 use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
+use portable_pty::PtySize;
 use rangeset::RangeSet;
 use std::collections::HashMap;
 use std::io::Write;
 use std::ops::Range;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -114,8 +128,13 @@ struct LastDetection {
 pub struct ElwoodPane {
     pane_id: PaneId,
     domain_id: DomainId,
-    terminal: Mutex<Terminal>,
-    writer: Mutex<Box<dyn Write + Send>>,
+    terminal: Arc<Mutex<Terminal>>,
+    /// Swappable writer: points to sink in agent mode, PTY stdin in terminal mode.
+    /// The Terminal's internal writer is a clone of this; swapping the destination
+    /// transparently reroutes Terminal::key_down() writes.
+    shared_writer: SharedWriter,
+    /// Mutex-wrapped writer for the Pane trait's writer() method.
+    pane_writer: Mutex<Box<dyn Write + Send>>,
     bridge: Arc<RuntimeBridge>,
     seqno: AtomicUsize,
     dead: Mutex<bool>,
@@ -137,6 +156,20 @@ pub struct ElwoodPane {
     detector: ContentDetector,
     /// Next-command suggester.
     suggester: NextCommandSuggester,
+    /// Session log for markdown export.
+    session_log: Mutex<SessionLog>,
+    /// Embedded PTY. `None` until the user first enters terminal mode (Ctrl+T).
+    inner_pty: Mutex<Option<InnerPty>>,
+    /// Active diff viewer for code review. When `Some`, key events are routed here.
+    diff_viewer: Mutex<Option<DiffViewer>>,
+    /// NL classifier for auto-detecting input mode on submit.
+    nl_classifier: NlClassifier,
+    /// Completion engine for ghost text suggestions.
+    completion_engine: Mutex<CompletionEngine>,
+    /// Command palette overlay (Ctrl+P).
+    palette: Mutex<CommandPalette>,
+    /// Fuzzy history search overlay (Ctrl+R).
+    history_search: Mutex<HistorySearch>,
 }
 
 /// A pending permission request waiting for user approval.
@@ -154,23 +187,34 @@ impl ElwoodPane {
         size: TerminalSize,
         bridge: Arc<RuntimeBridge>,
     ) -> Self {
+        let shared_writer = SharedWriter::new();
+
         let terminal = Terminal::new(
             size,
             Arc::new(ElwoodTermConfig),
             "Elwood",
             "0.1.0",
-            Box::new(std::io::sink()),
+            // Terminal's internal writer goes through SharedWriter so that
+            // key_down() writes route to sink (agent mode) or PTY (terminal mode).
+            Box::new(shared_writer.clone()),
         );
+
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
         let mut screen_state = ScreenState::default();
         screen_state.width = size.cols as u16;
         screen_state.height = size.rows as u16;
+        screen_state.git_info = git_info::get_git_info(&cwd);
+
+        // A separate clone of the shared_writer for the Pane::writer() trait method.
+        let pane_writer_clone = shared_writer.clone();
 
         let pane = Self {
             pane_id,
             domain_id,
-            terminal: Mutex::new(terminal),
-            writer: Mutex::new(Box::new(std::io::sink())),
+            terminal: Arc::new(Mutex::new(terminal)),
+            shared_writer,
+            pane_writer: Mutex::new(Box::new(pane_writer_clone)),
             bridge,
             seqno: AtomicUsize::new(0),
             dead: Mutex::new(false),
@@ -183,6 +227,13 @@ impl ElwoodPane {
             last_detection: Mutex::new(None),
             detector: ContentDetector::new(),
             suggester: NextCommandSuggester::new(),
+            session_log: Mutex::new(SessionLog::new(cwd)),
+            inner_pty: Mutex::new(None),
+            diff_viewer: Mutex::new(None),
+            nl_classifier: NlClassifier::new(),
+            completion_engine: Mutex::new(CompletionEngine::new()),
+            palette: Mutex::new(CommandPalette::new()),
+            history_search: Mutex::new(HistorySearch::new()),
         };
 
         // Render the full-screen TUI layout (includes welcome message)
@@ -378,6 +429,39 @@ impl ElwoodPane {
                                 self.write_ansi(&screen::format_next_command_suggestion(suggestion));
                             }
                         }
+                        AgentResponse::FileEdit {
+                            file_path,
+                            old_content,
+                            new_content,
+                            description,
+                        } => {
+                            // Compute the diff and open the diff viewer
+                            let file_diff = diff::compute_file_diff(
+                                Some(file_path),
+                                file_path,
+                                old_content,
+                                new_content,
+                                3,
+                            );
+                            let viewer = DiffViewer::new(
+                                vec![file_diff],
+                                description.clone(),
+                            );
+                            // Render the diff into the chat area
+                            let width = self.screen.lock().width as usize;
+                            let rendered = viewer.render(width);
+                            *self.diff_viewer.lock() = Some(viewer);
+                            self.write_ansi(&rendered);
+                            // Mark idle — user now reviews
+                            *self.state.lock() = PaneState::Idle;
+                            let mut ss = self.screen.lock();
+                            ss.is_running = false;
+                            ss.active_tool = None;
+                            ss.tool_start = None;
+                            ss.task_elapsed_frozen = ss.task_start
+                                .map(|s| s.elapsed().as_secs());
+                            ss.task_start = None;
+                        }
                         AgentResponse::Error(_) => {
                             *self.state.lock() = PaneState::Idle;
                             let mut ss = self.screen.lock();
@@ -385,6 +469,9 @@ impl ElwoodPane {
                             ss.awaiting_permission = false;
                             ss.active_tool = None;
                             ss.tool_start = None;
+                        }
+                        AgentResponse::PtyScreenSnapshot { .. } => {
+                            // PTY screen snapshots are handled by the PTY pane, not here
                         }
                         AgentResponse::Shutdown => {
                             *self.dead.lock() = true;
@@ -400,6 +487,32 @@ impl ElwoodPane {
                         }
                     };
                     *self.title.lock() = new_title;
+
+                    // Log to session
+                    match &response {
+                        AgentResponse::ContentDelta(text) => {
+                            self.session_log.lock().log_agent(text);
+                        }
+                        AgentResponse::ToolStart { tool_name, input_preview, .. } => {
+                            self.session_log.lock().log_tool(tool_name, &format!("started: {input_preview}"));
+                        }
+                        AgentResponse::ToolEnd { success, output_preview, .. } => {
+                            let status = if *success { "OK" } else { "FAIL" };
+                            self.session_log.lock().log_tool("ToolEnd", &format!("{status}: {output_preview}"));
+                        }
+                        AgentResponse::CommandOutput { stdout, stderr, exit_code, .. } => {
+                            self.session_log.lock().log_command_output(stdout, stderr, *exit_code);
+                            // Refresh git info after commands (may have changed branch/state)
+                            if let Some(cwd) = std::env::current_dir().ok() {
+                                let mut ss = self.screen.lock();
+                                ss.git_info = git_info::get_git_info(&cwd);
+                            }
+                        }
+                        AgentResponse::Error(msg) => {
+                            self.session_log.lock().log_system(&format!("Error: {msg}"));
+                        }
+                        _ => {}
+                    }
 
                     // Render content into the scroll region
                     let text = format_response_for_chat(&response);
@@ -417,6 +530,20 @@ impl ElwoodPane {
 
         if any_update {
             self.refresh_status_bar();
+        }
+
+        // Check if the PTY child has exited (detected by reader thread EOF)
+        {
+            let mode = self.input_editor.lock().mode();
+            if mode == InputMode::Terminal {
+                let pty_dead = {
+                    let pty_guard = self.inner_pty.lock();
+                    pty_guard.as_ref().is_some_and(|p| p.is_dead())
+                };
+                if pty_dead {
+                    self.handle_pty_exit();
+                }
+            }
         }
     }
 
@@ -449,6 +576,10 @@ impl ElwoodPane {
     }
 
     /// Toggle between Agent and Terminal input modes.
+    ///
+    /// When switching to Terminal mode for the first time, lazily spawns a
+    /// PTY with the user's shell. The SharedWriter is swapped to route
+    /// Terminal::key_down() writes to the PTY stdin.
     fn toggle_input_mode(&self) {
         let new_mode = {
             let mut editor = self.input_editor.lock();
@@ -459,6 +590,53 @@ impl ElwoodPane {
             editor.set_mode(new);
             new
         };
+
+        match new_mode {
+            InputMode::Terminal => {
+                // Spawn PTY on first entry to terminal mode
+                let mut pty_guard = self.inner_pty.lock();
+                if pty_guard.is_none() {
+                    let ss = self.screen.lock();
+                    let size = PtySize {
+                        rows: ss.height,
+                        cols: ss.width,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    };
+                    drop(ss);
+
+                    let cwd = std::env::current_dir()
+                        .unwrap_or_else(|_| PathBuf::from("."));
+
+                    match InnerPty::spawn(size, &cwd, &self.terminal, &self.shared_writer) {
+                        Ok(inner) => {
+                            *pty_guard = Some(inner);
+                            tracing::info!("PTY spawned for terminal mode");
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to spawn PTY: {e}");
+                            self.write_ansi(&screen::format_error(
+                                &format!("Failed to spawn PTY: {e}"),
+                            ));
+                        }
+                    }
+                } else {
+                    // PTY already exists — swap writer back to PTY
+                    // (it was swapped to sink when we left terminal mode)
+                    // Actually: in current design the shared_writer stays pointed
+                    // at the PTY master writer once spawned. We only swap to sink
+                    // when the PTY dies. So nothing to do here.
+                }
+            }
+            InputMode::Agent => {
+                // Switching back to agent mode.
+                // The PTY stays alive in the background. Writer stays pointed
+                // at the PTY so that if the user switches back, keystrokes
+                // route correctly. Agent mode routes keys to InputEditor
+                // before they reach Terminal::key_down(), so the writer
+                // destination doesn't matter in agent mode.
+            }
+        }
 
         // Sync to screen state and refresh chrome
         let mut ss = self.screen.lock();
@@ -478,6 +656,12 @@ impl ElwoodPane {
         // Clear input box screen state
         self.sync_editor_to_screen();
         self.refresh_input_box();
+
+        // Record to completion engine and history search
+        self.record_submission(&command, InputMode::Terminal);
+
+        // Log to session
+        self.session_log.lock().log_command(&command);
 
         // Write "$ command" prompt into chat area
         self.write_ansi(&screen::format_command_prompt(&command));
@@ -513,8 +697,32 @@ impl ElwoodPane {
         self.sync_editor_to_screen();
         self.refresh_input_box();
 
-        // Write user prompt into chat area (scroll region)
-        self.write_ansi(&screen::format_user_prompt(&content));
+        // Record to completion engine and history search
+        self.record_submission(&content, InputMode::Agent);
+
+        // ── Slash command routing ────────────────────────────────────
+        if let Some((cmd_name, args)) = commands::parse_command(&content) {
+            let model_name = self.screen.lock().model_name.clone();
+            let result = commands::execute_command(cmd_name, args, &model_name);
+            self.handle_command_result(&content, result);
+            return;
+        }
+
+        // ── @ context attachment ─────────────────────────────────────
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let (attachments, augmented_content) = context::resolve_and_build_prompt(&content, &cwd);
+
+        // Log to session
+        self.session_log.lock().log_user(&content);
+
+        // Write user prompt into chat area (show original, not augmented)
+        let display_content = if attachments.is_empty() {
+            content.clone()
+        } else {
+            let labels: Vec<&str> = attachments.iter().map(|a| a.label.as_str()).collect();
+            format!("{content}\n  [attached: {}]", labels.join(", "))
+        };
+        self.write_ansi(&screen::format_user_prompt(&display_content));
 
         // Write the "Elwood" prefix before streaming starts
         self.write_ansi(&screen::format_assistant_prefix());
@@ -529,8 +737,97 @@ impl ElwoodPane {
         *self.state.lock() = PaneState::Running;
         self.refresh_status_bar();
 
-        // Send to agent via bridge
-        let _ = self.bridge.send_request(AgentRequest::SendMessage { content });
+        // Send to agent via bridge (use augmented content with file context)
+        let _ = self.bridge.send_request(AgentRequest::SendMessage {
+            content: augmented_content,
+        });
+    }
+
+    /// Handle the result of a slash command execution.
+    fn handle_command_result(&self, original_input: &str, result: CommandResult) {
+        // Echo the command in chat
+        self.write_ansi(&screen::format_command_prompt(original_input));
+
+        match result {
+            CommandResult::ChatMessage(msg) => {
+                self.write_ansi(&screen::format_command_response(&msg));
+            }
+            CommandResult::AgentRequest(request) => {
+                self.write_ansi(&screen::format_assistant_prefix());
+                {
+                    let mut ss = self.screen.lock();
+                    ss.is_running = true;
+                    ss.task_start = Some(Instant::now());
+                    ss.task_elapsed_frozen = None;
+                }
+                *self.state.lock() = PaneState::Running;
+                self.refresh_status_bar();
+                let _ = self.bridge.send_request(request);
+            }
+            CommandResult::ClearChat => {
+                self.write_ansi("\x1b[2J");
+                let ss = self.screen.lock();
+                let full = screen::render_full_screen(&ss);
+                drop(ss);
+                self.write_ansi(&full);
+            }
+            CommandResult::ExportSession(path) => {
+                self.handle_export_to_path(&path);
+            }
+            CommandResult::OpenDiffViewer { staged } => {
+                self.open_git_diff_viewer(staged);
+            }
+            CommandResult::Unknown(name) => {
+                self.write_ansi(&screen::format_command_response(&format!(
+                    "Unknown command: /{name}\nType /help for available commands."
+                )));
+            }
+        }
+    }
+
+    /// Export session to a specific path (or default).
+    fn handle_export_to_path(&self, path: &str) {
+        if path.is_empty() {
+            match self.session_log.lock().export_to_file() {
+                Ok(p) => {
+                    let info = "\x1b[38;2;125;207;255m";
+                    self.write_ansi(&format!(
+                        "\r\n{info}  Session exported to: {}{RESET}\r\n",
+                        p.display(),
+                        RESET = "\x1b[0m",
+                    ));
+                }
+                Err(e) => {
+                    let err = "\x1b[38;2;247;118;142m";
+                    self.write_ansi(&format!(
+                        "\r\n{err}  Export failed: {e}{RESET}\r\n",
+                        RESET = "\x1b[0m",
+                    ));
+                }
+            }
+            return;
+        }
+
+        let target = PathBuf::from(path);
+        let markdown = self.session_log.lock().export_markdown();
+
+        match std::fs::write(&target, &markdown) {
+            Ok(()) => {
+                let info = "\x1b[38;2;125;207;255m";
+                self.write_ansi(&format!(
+                    "\r\n{info}  Session exported to: {}{RESET}\r\n",
+                    target.display(),
+                    RESET = "\x1b[0m",
+                ));
+            }
+            Err(e) => {
+                let err = "\x1b[38;2;247;118;142m";
+                self.write_ansi(&format!(
+                    "\r\n{err}  Export failed: {e}{RESET}\r\n",
+                    RESET = "\x1b[0m",
+                ));
+            }
+        }
     }
 
     /// Sync the InputEditor's current state into ScreenState for rendering.
@@ -540,8 +837,80 @@ impl ElwoodPane {
         ss.input_lines = editor.lines().to_vec();
         ss.cursor_row = editor.cursor_row();
         ss.cursor_col = editor.cursor_col();
+        ss.ghost_text = editor.ghost_text().map(String::from);
         // Keep legacy field in sync for single-line fallback
         ss.input_text = editor.lines().first().cloned().unwrap_or_default();
+    }
+
+    /// Update ghost text suggestion based on current editor content.
+    fn update_ghost_text(&self) {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let input = self.input_editor.lock().content();
+        let ghost = self.completion_engine.lock().ghost_text(&input, &cwd);
+        self.input_editor.lock().set_ghost_text(ghost);
+    }
+
+    /// Record submitted text to the completion engine and history search.
+    fn record_submission(&self, text: &str, mode: InputMode) {
+        self.completion_engine.lock().add_history(text.to_string());
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let cwd = std::env::current_dir().ok().map(|p| p.to_string_lossy().to_string());
+        self.history_search.lock().add_entry(HistoryRecord {
+            text: text.to_string(),
+            timestamp,
+            mode,
+            directory: cwd,
+            use_count: 1,
+        });
+    }
+
+    /// Execute a palette command string (e.g. "/help", "toggle_mode", "quick_fix").
+    fn execute_palette_command(&self, command: &str) {
+        match command {
+            "toggle_mode" => self.toggle_input_mode(),
+            "quick_fix" => self.handle_quick_fix(),
+            "nav_prev" => self.navigate_block_prev(),
+            "nav_next" => self.navigate_block_next(),
+            "history_search" => {
+                self.history_search.lock().open();
+                self.render_history_search_overlay();
+            }
+            cmd if cmd.starts_with('/') => {
+                // Route slash commands through the normal command handler
+                if let Some((cmd_name, args)) = commands::parse_command(cmd) {
+                    let model_name = self.screen.lock().model_name.clone();
+                    let result = commands::execute_command(cmd_name, args, &model_name);
+                    self.handle_command_result(cmd, result);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Render the palette overlay into the virtual terminal.
+    fn render_palette_overlay(&self) {
+        let palette = self.palette.lock();
+        let width = self.screen.lock().width;
+        let rendered = palette.render(width);
+        drop(palette);
+        if !rendered.is_empty() {
+            self.write_ansi(&rendered);
+        }
+    }
+
+    /// Render the history search overlay into the virtual terminal.
+    fn render_history_search_overlay(&self) {
+        let hs = self.history_search.lock();
+        let width = self.screen.lock().width;
+        let rendered = hs.render(width);
+        drop(hs);
+        if !rendered.is_empty() {
+            self.write_ansi(&rendered);
+        }
     }
 
     // ── Active AI quick-fix ─────────────────────────────────────────────────
@@ -600,6 +969,216 @@ impl ElwoodPane {
                 let _ = self.bridge.send_request(AgentRequest::SendMessage { content: prompt });
             }
         }
+        self.refresh_status_bar();
+    }
+
+    // ── PTY lifecycle ──────────────────────────────────────────────────────
+
+    /// Handle a key event while the diff viewer is active.
+    ///
+    /// Routes keys for navigation (j/k/n/]/[), actions (y/n/c/q), comment
+    /// input, and hunk collapse (Space). Comment mode is checked first so
+    /// that typing characters goes to the comment buffer.
+    fn handle_diff_viewer_key(&self, key: KeyCode, mods: KeyModifiers) -> anyhow::Result<()> {
+        let action = {
+            let mut viewer_guard = self.diff_viewer.lock();
+            let viewer = match viewer_guard.as_mut() {
+                Some(v) => v,
+                None => return Ok(()),
+            };
+
+            // ── Comment input mode (checked first) ──────────────
+            if viewer.commenting {
+                match key {
+                    KeyCode::Enter if mods.is_empty() => viewer.submit_comment(),
+                    KeyCode::Escape => viewer.cancel_comment(),
+                    KeyCode::Backspace => viewer.comment_backspace(),
+                    KeyCode::Char(c) if mods.is_empty() || mods == KeyModifiers::SHIFT => {
+                        viewer.comment_insert_char(c);
+                    }
+                    _ => {}
+                }
+                return self.rerender_diff_viewer_locked(viewer_guard);
+            }
+
+            // ── Normal navigation / actions ─────────────────────
+            match key {
+                KeyCode::Char('y') | KeyCode::Char('Y') if mods.is_empty() => {
+                    Some(ReviewAction::Approve)
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') if mods.is_empty() => {
+                    Some(ReviewAction::Reject)
+                }
+                KeyCode::Char('c') if mods.is_empty() => {
+                    viewer.start_comment();
+                    None
+                }
+                KeyCode::Char('j') | KeyCode::DownArrow if mods.is_empty() => {
+                    viewer.move_down();
+                    None
+                }
+                KeyCode::Char('k') | KeyCode::UpArrow if mods.is_empty() => {
+                    viewer.move_up();
+                    None
+                }
+                KeyCode::Char(']') if mods.is_empty() => {
+                    viewer.next_file();
+                    None
+                }
+                KeyCode::Char('[') if mods.is_empty() => {
+                    viewer.prev_file();
+                    None
+                }
+                KeyCode::Char(' ') if mods.is_empty() => {
+                    viewer.toggle_hunk_collapse();
+                    None
+                }
+                KeyCode::Char('q') | KeyCode::Escape => {
+                    drop(viewer_guard);
+                    *self.diff_viewer.lock() = None;
+                    self.write_ansi(
+                        "\r\n\x1b[38;2;86;95;137m\x1b[2m[Diff viewer closed]\x1b[0m\r\n",
+                    );
+                    return Ok(());
+                }
+                _ => None,
+            }
+        };
+
+        if let Some(review_action) = action {
+            // Extract comments and send review feedback
+            let (file_path, comments, approved) = {
+                let viewer = self.diff_viewer.lock();
+                let v = viewer.as_ref().expect("diff_viewer should be Some");
+                let fp = v
+                    .current_diff()
+                    .map(|d| d.new_path.clone())
+                    .unwrap_or_default();
+                let comments_vec: Vec<(String, usize, String)> = v
+                    .comments
+                    .iter()
+                    .map(|c| {
+                        let f = v
+                            .diffs
+                            .get(c.file_idx)
+                            .map(|d| d.new_path.clone())
+                            .unwrap_or_default();
+                        (f, c.line_no, c.text.clone())
+                    })
+                    .collect();
+                let approved = matches!(review_action, ReviewAction::Approve);
+                (fp, comments_vec, approved)
+            };
+
+            *self.diff_viewer.lock() = None;
+
+            let _ = self.bridge.send_request(AgentRequest::ReviewFeedback {
+                file_path,
+                comments,
+                approved,
+            });
+
+            let msg = if approved {
+                "\r\n\x1b[38;2;158;206;106m\x1b[1m\u{2714} Changes approved\x1b[0m\r\n"
+            } else {
+                "\r\n\x1b[38;2;247;118;142m\x1b[1m\u{2717} Changes rejected\x1b[0m\r\n"
+            };
+            self.write_ansi(msg);
+            self.refresh_status_bar();
+        } else {
+            // Re-render after navigation
+            let viewer = self.diff_viewer.lock();
+            if let Some(ref v) = *viewer {
+                let width = self.screen.lock().width as usize;
+                let rendered = v.render(width);
+                drop(viewer);
+                self.write_ansi(&rendered);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Re-render the diff viewer from a held lock, then write to terminal.
+    fn rerender_diff_viewer_locked(
+        &self,
+        viewer_guard: parking_lot::MutexGuard<'_, Option<DiffViewer>>,
+    ) -> anyhow::Result<()> {
+        if let Some(ref v) = *viewer_guard {
+            let width = self.screen.lock().width as usize;
+            let rendered = v.render(width);
+            drop(viewer_guard);
+            self.write_ansi(&rendered);
+        }
+        Ok(())
+    }
+
+    /// Open the diff viewer for git diff output (from `/diff` command).
+    fn open_git_diff_viewer(&self, staged: bool) {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        match diff::git_diff(&cwd, staged) {
+            Ok(diffs) => {
+                if diffs.is_empty() {
+                    self.write_ansi(&screen::format_command_response(
+                        "No changes (working tree clean).",
+                    ));
+                    return;
+                }
+
+                let desc = if staged {
+                    "Staged changes"
+                } else {
+                    "Working directory changes"
+                };
+                let viewer = DiffViewer::new(diffs, desc.to_string());
+                let width = self.screen.lock().width as usize;
+                let rendered = viewer.render(width);
+                *self.diff_viewer.lock() = Some(viewer);
+                self.write_ansi(&rendered);
+            }
+            Err(e) => {
+                self.write_ansi(&screen::format_error(&format!(
+                    "Failed to get git diff: {e}"
+                )));
+            }
+        }
+    }
+
+    /// Handle the PTY child process exit.
+    ///
+    /// Switches back to Agent mode, resets the SharedWriter to sink,
+    /// cleans up the InnerPty, and shows the exit status in the chat area.
+    fn handle_pty_exit(&self) {
+        // Get exit status before cleanup
+        let exit_info = {
+            let mut pty_guard = self.inner_pty.lock();
+            let info = pty_guard.as_mut().and_then(|p| {
+                p.try_wait().map(|status| format!("Shell exited ({})", status))
+            }).unwrap_or_else(|| "Shell exited".to_string());
+            // Kill and drop the inner PTY
+            *pty_guard = None;
+            info
+        };
+
+        // Reset writer to sink
+        self.shared_writer.swap_to_sink();
+
+        // Switch back to agent mode
+        {
+            let mut editor = self.input_editor.lock();
+            editor.set_mode(InputMode::Agent);
+        }
+        {
+            let mut ss = self.screen.lock();
+            ss.input_mode = InputMode::Agent;
+        }
+
+        // Show exit info in chat area
+        self.write_ansi(&format!(
+            "\r\n\x1b[38;2;86;95;137m\x1b[3m  {exit_info}\x1b[0m\r\n"
+        ));
+
+        self.refresh_input_box();
         self.refresh_status_bar();
     }
 
@@ -711,6 +1290,10 @@ fn format_response_for_chat(response: &AgentResponse) -> String {
         AgentResponse::TurnComplete { summary } => {
             screen::format_turn_complete(summary.as_deref())
         }
+        // FileEdit rendering is handled directly in poll_responses
+        AgentResponse::FileEdit { .. } => String::new(),
+        // PtyScreenSnapshot is handled internally
+        AgentResponse::PtyScreenSnapshot { .. } => String::new(),
         AgentResponse::Error(msg) => screen::format_error(msg),
         AgentResponse::Shutdown => screen::format_shutdown(),
     }
@@ -779,7 +1362,16 @@ impl mux::pane::Pane for ElwoodPane {
     }
 
     fn send_paste(&self, text: &str) -> anyhow::Result<()> {
-        // Treat pasted text as input — insert each character into the editor
+        // In terminal mode with active PTY, send paste through Terminal
+        let mode = self.input_editor.lock().mode();
+        if mode == InputMode::Terminal && self.inner_pty.lock().is_some() {
+            let mut terminal = self.terminal.lock();
+            terminal.send_paste(text)?;
+            self.seqno.fetch_add(1, Ordering::Release);
+            return Ok(());
+        }
+
+        // Agent mode: treat pasted text as input editor content
         {
             let mut editor = self.input_editor.lock();
             for ch in text.chars() {
@@ -800,7 +1392,7 @@ impl mux::pane::Pane for ElwoodPane {
     }
 
     fn writer(&self) -> MappedMutexGuard<'_, dyn Write> {
-        MutexGuard::map(self.writer.lock(), |w| {
+        MutexGuard::map(self.pane_writer.lock(), |w| {
             let w: &mut dyn Write = &mut **w;
             w
         })
@@ -811,6 +1403,22 @@ impl mux::pane::Pane for ElwoodPane {
         {
             let mut terminal = self.terminal.lock();
             terminal.resize(size);
+        }
+
+        // Resize the inner PTY if present
+        {
+            let pty_guard = self.inner_pty.lock();
+            if let Some(ref inner) = *pty_guard {
+                let pty_size = PtySize {
+                    rows: size.rows as u16,
+                    cols: size.cols as u16,
+                    pixel_width: size.pixel_width as u16,
+                    pixel_height: size.pixel_height as u16,
+                };
+                if let Err(e) = inner.resize(pty_size) {
+                    tracing::warn!("Failed to resize PTY: {e}");
+                }
+            }
         }
 
         // Update screen state dimensions and re-render the full layout
@@ -850,16 +1458,179 @@ impl mux::pane::Pane for ElwoodPane {
             }
         }
 
-        // Ctrl+T toggles input mode (before other handling)
+        // ── Diff viewer mode: route keys to the diff viewer ────────────
+        if self.diff_viewer.lock().is_some() {
+            return self.handle_diff_viewer_key(key, mods);
+        }
+
+        // ── Command palette mode: route all keys to palette ──────────
+        {
+            let palette_open = self.palette.lock().is_open();
+            if palette_open {
+                match key {
+                    KeyCode::Escape => {
+                        self.palette.lock().close();
+                    }
+                    KeyCode::Enter => {
+                        let command = self.palette.lock().selected_command()
+                            .map(String::from);
+                        self.palette.lock().close();
+                        if let Some(cmd) = command {
+                            self.execute_palette_command(&cmd);
+                        }
+                    }
+                    KeyCode::UpArrow => {
+                        self.palette.lock().select_prev();
+                        self.render_palette_overlay();
+                    }
+                    KeyCode::DownArrow => {
+                        self.palette.lock().select_next();
+                        self.render_palette_overlay();
+                    }
+                    KeyCode::Backspace => {
+                        self.palette.lock().backspace();
+                        self.render_palette_overlay();
+                    }
+                    KeyCode::Char(c) if mods.is_empty() || mods == KeyModifiers::SHIFT => {
+                        self.palette.lock().type_char(c);
+                        self.render_palette_overlay();
+                    }
+                    _ => {}
+                }
+                return Ok(());
+            }
+        }
+
+        // ── History search mode: route all keys to history search ──────
+        {
+            let hs_open = self.history_search.lock().is_open();
+            if hs_open {
+                match key {
+                    KeyCode::Escape => {
+                        self.history_search.lock().close();
+                    }
+                    KeyCode::Enter => {
+                        let text = self.history_search.lock().selected_text()
+                            .map(String::from);
+                        self.history_search.lock().close();
+                        if let Some(selected) = text {
+                            // Insert selected text into editor
+                            let mut editor = self.input_editor.lock();
+                            editor.clear();
+                            for c in selected.chars() {
+                                editor.insert_char(c);
+                            }
+                            drop(editor);
+                            self.sync_editor_to_screen();
+                            self.refresh_input_box();
+                        }
+                    }
+                    KeyCode::UpArrow => {
+                        self.history_search.lock().select_prev();
+                        self.render_history_search_overlay();
+                    }
+                    KeyCode::DownArrow => {
+                        self.history_search.lock().select_next();
+                        self.render_history_search_overlay();
+                    }
+                    KeyCode::Backspace => {
+                        self.history_search.lock().backspace();
+                        self.render_history_search_overlay();
+                    }
+                    KeyCode::Char(c) if mods.is_empty() || mods == KeyModifiers::SHIFT => {
+                        self.history_search.lock().type_char(c);
+                        self.render_history_search_overlay();
+                    }
+                    _ => {}
+                }
+                return Ok(());
+            }
+        }
+
+        // Ctrl+P toggles command palette
+        if key == KeyCode::Char('p') && mods == KeyModifiers::CTRL {
+            self.palette.lock().toggle();
+            self.render_palette_overlay();
+            return Ok(());
+        }
+
+        // Ctrl+R opens history search
+        if key == KeyCode::Char('r') && mods == KeyModifiers::CTRL {
+            self.history_search.lock().open();
+            self.render_history_search_overlay();
+            return Ok(());
+        }
+
+        // Ctrl+T toggles input mode (always intercepted, never forwarded to PTY)
         if key == KeyCode::Char('t') && mods == KeyModifiers::CTRL {
             self.toggle_input_mode();
             return Ok(());
         }
 
+        // ── Terminal mode with active PTY: forward keys to PTY via Terminal ──
+        let mode = self.input_editor.lock().mode();
+        if mode == InputMode::Terminal && self.inner_pty.lock().is_some() {
+            // Check if PTY child has exited — auto-switch back to agent mode
+            {
+                let pty_guard = self.inner_pty.lock();
+                if let Some(ref pty) = *pty_guard {
+                    if pty.is_dead() {
+                        drop(pty_guard);
+                        self.handle_pty_exit();
+                        return Ok(());
+                    }
+                }
+            }
+
+            // Forward keystroke through Terminal::key_down(), which encodes it
+            // and writes to SharedWriter -> PTY stdin.
+            let mut terminal = self.terminal.lock();
+            terminal.key_down(key, mods)?;
+            self.seqno.fetch_add(1, Ordering::Release);
+            return Ok(());
+        }
+
+        // ── Agent mode: route keys to InputEditor ────────────────────────────
+
         // Ctrl+F: quick-fix — send last detected error to the agent
         if key == KeyCode::Char('f') && mods == KeyModifiers::CTRL {
             self.handle_quick_fix();
             return Ok(());
+        }
+
+        // Tab: accept full ghost text suggestion (if at end of line and ghost present)
+        if key == KeyCode::Tab && mods.is_empty() {
+            let accepted = {
+                let mut editor = self.input_editor.lock();
+                if editor.at_end_of_line() {
+                    editor.accept_suggestion()
+                } else {
+                    false
+                }
+            };
+            if accepted {
+                self.sync_editor_to_screen();
+                self.refresh_input_box();
+                return Ok(());
+            }
+        }
+
+        // Right arrow at end of line: accept one word from ghost text
+        if key == KeyCode::RightArrow && mods.is_empty() {
+            let accepted = {
+                let mut editor = self.input_editor.lock();
+                if editor.at_end_of_line() && editor.ghost_text().is_some() {
+                    editor.accept_next_word()
+                } else {
+                    false
+                }
+            };
+            if accepted {
+                self.update_ghost_text();
+                self.sync_editor_to_screen();
+                self.refresh_input_box();
+                return Ok(());
+            }
         }
 
         let mut editor_changed = true;
@@ -890,7 +1661,17 @@ impl mux::pane::Pane for ElwoodPane {
                             }
                             self.submit_command();
                         } else {
-                            self.submit_input();
+                            // NL auto-detection: classify input and auto-route
+                            // high-confidence terminal commands to shell
+                            let content = self.input_editor.lock().content();
+                            let classification = self.nl_classifier.classify(&content);
+                            if classification.mode == InputMode::Terminal
+                                && classification.confidence >= 0.5
+                            {
+                                self.submit_command();
+                            } else {
+                                self.submit_input();
+                            }
                         }
                     }
                     InputMode::Terminal => {
@@ -994,6 +1775,8 @@ impl mux::pane::Pane for ElwoodPane {
         }
 
         if editor_changed {
+            // Update ghost text suggestion from completion engine
+            self.update_ghost_text();
             self.sync_editor_to_screen();
             self.refresh_input_box();
         }
@@ -1017,10 +1800,31 @@ impl mux::pane::Pane for ElwoodPane {
     }
 
     fn is_dead(&self) -> bool {
-        *self.dead.lock()
+        if *self.dead.lock() {
+            return true;
+        }
+        // Check if the PTY child has exited while we are in terminal mode
+        let pty_guard = self.inner_pty.lock();
+        if let Some(ref pty) = *pty_guard {
+            if pty.is_dead() {
+                // Don't auto-switch here — that's done in poll_responses/key_down
+                return false; // Pane is not dead, just the PTY child
+            }
+        }
+        false
     }
 
     fn kill(&self) {
+        // Kill the inner PTY if present
+        {
+            let mut pty_guard = self.inner_pty.lock();
+            if let Some(ref mut pty) = *pty_guard {
+                pty.kill();
+            }
+            *pty_guard = None;
+        }
+        self.shared_writer.swap_to_sink();
+
         let _ = self.bridge.send_request(AgentRequest::Shutdown);
         *self.dead.lock() = true;
     }
@@ -1034,10 +1838,18 @@ impl mux::pane::Pane for ElwoodPane {
     }
 
     fn is_mouse_grabbed(&self) -> bool {
+        // When PTY is active, check if the running program grabbed the mouse
+        if self.inner_pty.lock().is_some() {
+            return self.terminal.lock().is_mouse_grabbed();
+        }
         false
     }
 
     fn is_alt_screen_active(&self) -> bool {
+        // When PTY is active, check if a full-screen program (vim, htop) is running
+        if self.inner_pty.lock().is_some() {
+            return self.terminal.lock().is_alt_screen_active();
+        }
         false
     }
 
