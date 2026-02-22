@@ -14,6 +14,7 @@
 //! `cursor_col` is 0-based byte column within the line (always clamped to char boundaries).
 
 use crate::runtime::InputMode;
+use crate::vim_mode::{VimMode, VimState};
 
 /// Maximum number of lines in a single input (hard cap for rendering).
 pub const MAX_INPUT_LINES: usize = 8;
@@ -55,6 +56,8 @@ pub struct InputEditor {
     history_draft: Option<Vec<String>>,
     /// Current ghost text suggestion (the suffix after the cursor).
     ghost_text: Option<String>,
+    /// Optional vim modal editing state. `None` when vim mode is off.
+    vim_mode: Option<VimMode>,
 }
 
 impl InputEditor {
@@ -70,6 +73,7 @@ impl InputEditor {
             history_index: None,
             history_draft: None,
             ghost_text: None,
+            vim_mode: None,
         }
     }
 
@@ -116,6 +120,40 @@ impl InputEditor {
     pub fn set_mode(&mut self, mode: InputMode) {
         self.mode = mode;
         self.reset_history_state();
+    }
+
+    // ─── Vim Mode ──────────────────────────────────────────────────────
+
+    /// Returns `true` if vim mode is currently enabled.
+    pub fn vim_enabled(&self) -> bool {
+        self.vim_mode.is_some()
+    }
+
+    /// Enable vim mode.
+    pub fn vim_enable(&mut self) {
+        if self.vim_mode.is_none() {
+            self.vim_mode = Some(VimMode::new());
+        }
+    }
+
+    /// Disable vim mode.
+    pub fn vim_disable(&mut self) {
+        self.vim_mode = None;
+    }
+
+    /// Current vim state (Normal/Insert/Visual/Command), or `None` if vim is off.
+    pub fn vim_state(&self) -> Option<VimState> {
+        self.vim_mode.as_ref().map(|v| v.state())
+    }
+
+    /// Access the vim mode state (if enabled) for rendering command buffer etc.
+    pub fn vim(&self) -> Option<&VimMode> {
+        self.vim_mode.as_ref()
+    }
+
+    /// Mutable access to the vim mode state (if enabled).
+    pub fn vim_mut(&mut self) -> Option<&mut VimMode> {
+        self.vim_mode.as_mut()
     }
 
     // ─── Edit Operations ────────────────────────────────────────────────
@@ -189,6 +227,111 @@ impl InputEditor {
         if col > 0 {
             self.lines[self.cursor_row].replace_range(..col, "");
             self.cursor_col = 0;
+        }
+    }
+
+    /// Delete text in the range (start_row, start_col) .. (end_row, end_col).
+    ///
+    /// Used by vim mode operators. Cursor is placed at the start of the range.
+    pub fn delete_range(
+        &mut self,
+        start_row: usize,
+        start_col: usize,
+        end_row: usize,
+        end_col: usize,
+    ) {
+        self.reset_history_state();
+        if start_row == end_row {
+            // Same line deletion
+            if let Some(line) = self.lines.get_mut(start_row) {
+                let s = start_col.min(line.len());
+                let e = end_col.min(line.len());
+                if s < e {
+                    line.replace_range(s..e, "");
+                }
+            }
+        } else {
+            // Multi-line deletion: keep prefix of start_row + suffix of end_row
+            let prefix = self.lines.get(start_row)
+                .map(|l| l[..start_col.min(l.len())].to_string())
+                .unwrap_or_default();
+            let suffix = self.lines.get(end_row)
+                .map(|l| l[end_col.min(l.len())..].to_string())
+                .unwrap_or_default();
+
+            // Remove the range of lines
+            let remove_end = (end_row + 1).min(self.lines.len());
+            if start_row < remove_end {
+                self.lines.drain(start_row..remove_end);
+            }
+            // Insert the merged line
+            self.lines.insert(start_row, format!("{prefix}{suffix}"));
+        }
+        self.cursor_row = start_row.min(self.lines.len().saturating_sub(1));
+        self.cursor_col = start_col.min(
+            self.lines.get(self.cursor_row).map(|l| l.len()).unwrap_or(0),
+        );
+        if self.lines.is_empty() {
+            self.lines.push(String::new());
+            self.cursor_row = 0;
+            self.cursor_col = 0;
+        }
+    }
+
+    /// Delete an entire line and move cursor appropriately.
+    pub fn delete_line(&mut self, row: usize) {
+        self.reset_history_state();
+        if self.lines.len() <= 1 {
+            // Can't delete the last line — just clear it
+            self.lines[0].clear();
+            self.cursor_row = 0;
+            self.cursor_col = 0;
+            return;
+        }
+        if row < self.lines.len() {
+            self.lines.remove(row);
+        }
+        self.cursor_row = row.min(self.lines.len().saturating_sub(1));
+        self.cursor_col = 0;
+    }
+
+    /// Replace a single character at (row, col) with `ch`.
+    pub fn replace_char(&mut self, row: usize, col: usize, ch: char) {
+        self.reset_history_state();
+        if let Some(line) = self.lines.get_mut(row) {
+            if col < line.len() {
+                // Find the end of the current char at col
+                let mut end = col + 1;
+                while end < line.len() && !line.is_char_boundary(end) {
+                    end += 1;
+                }
+                line.replace_range(col..end, &ch.to_string());
+            }
+        }
+    }
+
+    /// Insert text at the current cursor position (used for paste).
+    pub fn insert_text(&mut self, text: &str) {
+        self.reset_history_state();
+        for ch in text.chars() {
+            if ch == '\n' {
+                self.insert_newline();
+            } else {
+                self.insert_char(ch);
+            }
+        }
+    }
+
+    /// Set cursor position directly (clamped to valid bounds).
+    pub fn set_cursor(&mut self, row: usize, col: usize) {
+        self.cursor_row = row.min(self.lines.len().saturating_sub(1));
+        let line_len = self.lines.get(self.cursor_row).map(|l| l.len()).unwrap_or(0);
+        self.cursor_col = col.min(line_len);
+        // Ensure we're on a char boundary
+        while self.cursor_col > 0
+            && !self.lines[self.cursor_row].is_char_boundary(self.cursor_col)
+        {
+            self.cursor_col -= 1;
         }
     }
 

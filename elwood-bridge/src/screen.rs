@@ -27,6 +27,7 @@
 use crate::git_info::GitInfo;
 use crate::runtime::InputMode;
 use crate::theme;
+use crate::vim_mode::VimState;
 use std::time::Instant;
 
 // ─── TokyoNight Color Palette ────────────────────────────────────────────
@@ -160,6 +161,10 @@ pub struct ScreenState {
     pub recording_paused: bool,
     /// Number of currently running background jobs.
     pub running_jobs: usize,
+    /// Current vim mode state (None = vim off).
+    pub vim_state: Option<VimState>,
+    /// Vim command-line buffer (for `:` mode rendering).
+    pub vim_command_buffer: String,
 }
 
 impl Default for ScreenState {
@@ -194,6 +199,8 @@ impl Default for ScreenState {
             recording_active: false,
             recording_paused: false,
             running_jobs: 0,
+            vim_state: None,
+            vim_command_buffer: String::new(),
         }
     }
 }
@@ -674,10 +681,31 @@ pub fn render_status_bar(state: &ScreenState) -> String {
         String::new()
     };
 
+    // Vim mode indicator
+    let vim_chip = match state.vim_state {
+        Some(VimState::Normal) => {
+            let sep = format!("{}·{RESET}{sbg}", fgc(MUTED));
+            format!(" {sep} {}{BOLD}NORMAL{RESET}{sbg}", fgc(SUCCESS))
+        }
+        Some(VimState::Insert) => {
+            let sep = format!("{}·{RESET}{sbg}", fgc(MUTED));
+            format!(" {sep} {}{BOLD}INSERT{RESET}{sbg}", fgc(ACCENT))
+        }
+        Some(VimState::Visual) => {
+            let sep = format!("{}·{RESET}{sbg}", fgc(MUTED));
+            format!(" {sep} {}{BOLD}VISUAL{RESET}{sbg}", fgc(WARNING))
+        }
+        Some(VimState::Command) => {
+            let sep = format!("{}·{RESET}{sbg}", fgc(MUTED));
+            format!(" {sep} {}:{}{RESET}{sbg}", fgc(WARNING), state.vim_command_buffer)
+        }
+        None => String::new(),
+    };
+
     // Assemble left section
     out.push_str(&goto(row, 1));
     out.push_str(&format!(
-        "{sbg} {mode_bg}{mode_fg}{BOLD}{mode_label}{RESET}{sbg}{rec_chip}{jobs_chip}{git_chip}{model_chip}{status_chip}",
+        "{sbg} {mode_bg}{mode_fg}{BOLD}{mode_label}{RESET}{sbg}{vim_chip}{rec_chip}{jobs_chip}{git_chip}{model_chip}{status_chip}",
     ));
 
     // ── Right section: tokens, cost, elapsed, keyboard hints ────────

@@ -100,6 +100,22 @@ pub enum AgentRequest {
     /// Kill a running background job.
     KillJob { job_id: u32 },
 
+    /// Spawn a new agent pane.
+    SpawnAgent {
+        /// Human-readable name for the agent (e.g. "backend").
+        name: Option<String>,
+        /// LLM model to use (e.g. "gemini-2.5-flash"). None = default model.
+        model: Option<String>,
+    },
+
+    /// Send a message to another agent.
+    MessageAgent {
+        /// Target agent ID.
+        target_id: u32,
+        /// The message content.
+        message: String,
+    },
+
     /// Gracefully shut down the agent runtime.
     Shutdown,
 }
@@ -225,6 +241,24 @@ pub enum AgentResponse {
         exit_code: Option<i32>,
         /// Process ID (set on first "running" update).
         pid: Option<u32>,
+    },
+
+    /// A new agent was spawned successfully.
+    AgentSpawned {
+        /// The assigned agent ID.
+        agent_id: u32,
+        /// The agent's name.
+        name: String,
+    },
+
+    /// A message was received from another agent.
+    AgentMessage {
+        /// Source agent ID.
+        from_id: u32,
+        /// Source agent name.
+        from_name: String,
+        /// The message content.
+        message: String,
     },
 
     /// An error occurred in the agent.

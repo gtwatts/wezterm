@@ -763,6 +763,10 @@ impl ElwoodPane {
                         AgentResponse::JobUpdate { .. } => {
                             // Handled by jobs panel (not yet wired)
                         }
+                        AgentResponse::AgentSpawned { .. }
+                        | AgentResponse::AgentMessage { .. } => {
+                            // Handled by multi-agent integration
+                        }
                     }
 
                     // Update window title
@@ -1322,10 +1326,34 @@ impl ElwoodPane {
                     "Unknown command: /{name}\nType /help for available commands."
                 )));
             }
+            CommandResult::RedactCommand(msg) => {
+                self.write_ansi(&screen::format_command_response(&msg));
+            }
+            CommandResult::LaunchCommand(_) => {
+                // Handled by launch config integration
+            }
+            CommandResult::AutocorrectCommand(msg) => {
+                self.write_ansi(&screen::format_command_response(&msg));
+            }
+            CommandResult::RehashCommands => {
+                // Handled by autocorrect integration
+            }
             CommandResult::OpenJobsPanel
             | CommandResult::RunBackground { .. }
             | CommandResult::KillJob { .. } => {
                 // Handled by jobs panel integration (not yet wired)
+            }
+            CommandResult::OpenInIde(msg) | CommandResult::EditorCommand(msg) => {
+                self.write_ansi(&screen::format_command_response(&msg));
+            }
+            CommandResult::AgentCommand(_) => {
+                // Handled by multi-agent integration
+            }
+            CommandResult::NotebookCommand(_) => {
+                // Handled by notebook integration
+            }
+            CommandResult::VimToggle(_) => {
+                // Handled by vim mode integration
             }
         }
     }

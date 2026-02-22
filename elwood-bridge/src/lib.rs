@@ -18,6 +18,7 @@
 //! - **PaneObserver**: Reads content from other WezTerm panes
 //! - **ANSI Formatter**: Converts `AgentEvent` to styled terminal output
 
+pub mod autocorrect;
 pub mod block;
 pub mod commands;
 pub mod completions;
@@ -31,13 +32,17 @@ pub mod file_browser;
 pub mod fuzzy_finder;
 pub mod git_info;
 pub mod git_ui;
+pub mod ide_bridge;
 pub mod jobs;
 pub mod history_search;
 pub mod keybindings;
+pub mod launch_config;
 pub mod lua_api;
 pub mod mcp;
 pub mod model_router;
+pub mod multi_agent;
 pub mod nl_classifier;
+pub mod notebook;
 pub mod notification;
 pub mod observer;
 pub mod palette;
@@ -47,6 +52,7 @@ pub mod plan_viewer;
 pub mod prediction_engine;
 pub mod pty_inner;
 pub mod recording;
+pub mod redaction;
 pub mod runtime;
 pub mod semantic_bridge;
 pub mod session_export;
@@ -54,6 +60,7 @@ pub mod session_log;
 pub mod shared_writer;
 pub mod suggestion_overlay;
 pub mod tools;
+pub mod vim_mode;
 pub mod workflow;
 
 mod formatter;

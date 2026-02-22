@@ -31,6 +31,17 @@ pub struct SlashCommand {
     pub usage: &'static str,
 }
 
+/// Action for the `/vim` slash command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VimToggleAction {
+    /// Enable vim mode.
+    On,
+    /// Disable vim mode.
+    Off,
+    /// Show current vim mode status.
+    Status,
+}
+
 /// Result of executing a slash command.
 #[derive(Debug, Clone)]
 pub enum CommandResult {
@@ -94,6 +105,24 @@ pub enum CommandResult {
     RunBackground { command: String },
     /// Kill a running background job (`/kill <id>`).
     KillJob { job_id: u32 },
+    /// Secret redaction command result (`/redact`).
+    RedactCommand(String),
+    /// Launch config command result (`/launch`).
+    LaunchCommand(crate::launch_config::LaunchCommandResult),
+    /// Autocorrect command result (`/autocorrect`).
+    AutocorrectCommand(String),
+    /// Refresh known commands cache (`/rehash`).
+    RehashCommands,
+    /// Agent management command (`/agent`, `/agents`, `/tell`).
+    AgentCommand(crate::multi_agent::AgentCommand),
+    /// Open file in IDE (`/open`).
+    OpenInIde(String),
+    /// Editor info/config (`/editor`).
+    EditorCommand(String),
+    /// Notebook command result (`/notebook` or `/nb`).
+    NotebookCommand(crate::notebook::NotebookCommand),
+    /// Toggle or query vim mode (`/vim on|off|status`).
+    VimToggle(VimToggleAction),
     /// Unknown or invalid command.
     Unknown(String),
 }
@@ -181,6 +210,61 @@ pub fn get_commands() -> Vec<SlashCommand> {
             description: "Kill a running background job",
             usage: "/kill <job_id>",
         },
+        SlashCommand {
+            name: "redact",
+            description: "Secret redaction (on/off/test/patterns)",
+            usage: "/redact [on|off|test <text>|patterns]",
+        },
+        SlashCommand {
+            name: "launch",
+            description: "Saved launch configs (list/apply/save/show/delete)",
+            usage: "/launch [list|apply|save|show|edit|delete] <name>",
+        },
+        SlashCommand {
+            name: "autocorrect",
+            description: "Toggle command auto-correction (on/off)",
+            usage: "/autocorrect [on|off]",
+        },
+        SlashCommand {
+            name: "rehash",
+            description: "Refresh known commands cache",
+            usage: "/rehash",
+        },
+        SlashCommand {
+            name: "agent",
+            description: "Manage agent panes (spawn/list/kill/focus)",
+            usage: "/agent <spawn|list|kill|focus> [args]",
+        },
+        SlashCommand {
+            name: "agents",
+            description: "List all agents (shortcut for /agent list)",
+            usage: "/agents",
+        },
+        SlashCommand {
+            name: "tell",
+            description: "Send a message to another agent",
+            usage: "/tell <name> <message>",
+        },
+        SlashCommand {
+            name: "open",
+            description: "Open file in IDE at optional line",
+            usage: "/open <file[:line[:col]]> | /open .",
+        },
+        SlashCommand {
+            name: "editor",
+            description: "Show/set preferred editor",
+            usage: "/editor [set <name>]",
+        },
+        SlashCommand {
+            name: "notebook",
+            description: "Interactive notebooks (list/open/create/import/export)",
+            usage: "/notebook [list|open|create|import|export] <name>",
+        },
+        SlashCommand {
+            name: "vim",
+            description: "Toggle vim mode (on/off/status)",
+            usage: "/vim [on|off]",
+        },
     ]
 }
 
@@ -230,6 +314,38 @@ pub fn execute_command(name: &str, args: &str, model_name: &str) -> CommandResul
         "jobs" => CommandResult::OpenJobsPanel,
         "bg" => execute_bg(args),
         "kill" => execute_kill(args),
+        "redact" => {
+            let redactor = crate::redaction::Redactor::new();
+            CommandResult::RedactCommand(
+                crate::redaction::execute_redact_command(args, &redactor),
+            )
+        }
+        "launch" | "lc" => {
+            let pane_state = crate::launch_config::PaneState::default();
+            CommandResult::LaunchCommand(
+                crate::launch_config::execute_launch_command(args, &pane_state),
+            )
+        }
+        "autocorrect" => execute_autocorrect(args),
+        "rehash" => CommandResult::RehashCommands,
+        "agent" => execute_agent(args),
+        "agents" => CommandResult::AgentCommand(crate::multi_agent::AgentCommand::List),
+        "tell" => execute_tell(args),
+        "open" => CommandResult::OpenInIde(
+            crate::ide_bridge::execute_open(args, "."),
+        ),
+        "editor" => CommandResult::EditorCommand(
+            crate::ide_bridge::execute_editor(args),
+        ),
+        "notebook" | "nb" => {
+            let cmd = crate::notebook::parse_notebook_command(args);
+            if cmd == crate::notebook::NotebookCommand::Help {
+                CommandResult::ChatMessage(crate::notebook::notebook_help())
+            } else {
+                CommandResult::NotebookCommand(cmd)
+            }
+        }
+        "vim" => execute_vim(args),
         _ => CommandResult::Unknown(name.to_string()),
     }
 }
@@ -487,6 +603,61 @@ fn execute_kill(args: &str) -> CommandResult {
         _ => CommandResult::ChatMessage(
             "Usage: /kill <job_id>\n\nKills a running background job.\n\
              Use /jobs to see job IDs."
+                .to_string(),
+        ),
+    }
+}
+
+/// `/autocorrect [on|off]` — toggle command auto-correction.
+fn execute_autocorrect(args: &str) -> CommandResult {
+    match args.trim() {
+        "on" => CommandResult::AutocorrectCommand("on".to_string()),
+        "off" => CommandResult::AutocorrectCommand("off".to_string()),
+        "" => CommandResult::AutocorrectCommand("status".to_string()),
+        other => CommandResult::ChatMessage(format!(
+            "Unknown autocorrect option: {other}\nUsage: /autocorrect [on|off]"
+        )),
+    }
+}
+
+/// `/agent <subcommand>` — manage agent panes.
+fn execute_agent(args: &str) -> CommandResult {
+    match crate::multi_agent::parse_agent_command(args) {
+        Some(crate::multi_agent::AgentCommand::Help) => {
+            CommandResult::ChatMessage(crate::multi_agent::agent_help_text())
+        }
+        Some(cmd) => CommandResult::AgentCommand(cmd),
+        None => CommandResult::ChatMessage(format!(
+            "Unknown agent subcommand: {}\n\n{}",
+            args.split_whitespace().next().unwrap_or(""),
+            crate::multi_agent::agent_help_text(),
+        )),
+    }
+}
+
+/// `/tell <name> <message>` — send a message to another agent.
+fn execute_tell(args: &str) -> CommandResult {
+    match crate::multi_agent::parse_tell_command(args) {
+        Some(cmd) => CommandResult::AgentCommand(cmd),
+        None => CommandResult::ChatMessage(
+            "Usage: /tell <agent-name> <message>\n\nSend a message to another agent.\n\
+             Use /agents to see available agents."
+                .to_string(),
+        ),
+    }
+}
+
+/// `/vim [on|off]` — toggle vim keybindings in the input editor.
+fn execute_vim(args: &str) -> CommandResult {
+    match args.trim() {
+        "on" => CommandResult::VimToggle(VimToggleAction::On),
+        "off" => CommandResult::VimToggle(VimToggleAction::Off),
+        "" | "status" => CommandResult::VimToggle(VimToggleAction::Status),
+        _ => CommandResult::ChatMessage(
+            "Usage: /vim [on|off]\n\nToggle vim-style modal editing.\n\
+             /vim on      Enable vim mode\n\
+             /vim off     Disable vim mode\n\
+             /vim         Show current status"
                 .to_string(),
         ),
     }
