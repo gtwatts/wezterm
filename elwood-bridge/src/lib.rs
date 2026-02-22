@@ -18,8 +18,10 @@
 //! - **PaneObserver**: Reads content from other WezTerm panes
 //! - **ANSI Formatter**: Converts `AgentEvent` to styled terminal output
 
+pub mod block;
 pub mod config;
 pub mod domain;
+pub mod editor;
 pub mod keybindings;
 pub mod lua_api;
 pub mod observer;
@@ -28,8 +30,9 @@ pub mod runtime;
 pub mod tools;
 
 mod formatter;
+pub mod screen;
 
 pub use domain::ElwoodDomain;
-pub use observer::{ContentDetector, ContentType, ContextualContent, PaneObserver};
+pub use observer::{ContentDetector, ContentType, ContextualContent, NextCommandSuggester, PaneObserver};
 pub use pane::ElwoodPane;
 pub use runtime::RuntimeBridge;

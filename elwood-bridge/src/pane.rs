@@ -33,6 +33,9 @@
 //! naturally within the bounded area. Chrome updates (header, input, status)
 //! use cursor save/restore to avoid disturbing the scroll position.
 
+use crate::block::BlockManager;
+use crate::editor::InputEditor;
+use crate::observer::{ContentDetector, ContentType, NextCommandSuggester};
 use crate::runtime::{AgentRequest, AgentResponse, InputMode, RuntimeBridge};
 use crate::screen::{self, ScreenState};
 
@@ -89,6 +92,19 @@ enum PaneState {
     AwaitingPermission,
 }
 
+/// Context captured from the last error detection, used to build a Ctrl+F quick-fix prompt.
+#[derive(Debug, Clone)]
+struct LastDetection {
+    /// The command that produced the output.
+    command: String,
+    /// Combined stdout+stderr that was analyzed.
+    output: String,
+    /// The human-readable label for the error type (e.g. "Compiler error").
+    label: String,
+    /// The source file extracted from the error, if any.
+    source_file: Option<String>,
+}
+
 /// WezTerm Pane implementation for Elwood agent output.
 ///
 /// Wraps a virtual terminal (`wezterm_term::Terminal`) and renders a
@@ -104,16 +120,23 @@ pub struct ElwoodPane {
     seqno: AtomicUsize,
     dead: Mutex<bool>,
     title: Mutex<String>,
-    /// Accumulates user keyboard input for the prompt.
-    input_buffer: Mutex<String>,
+    /// Multi-line input editor (replaces the old `input_buffer: Mutex<String>`).
+    input_editor: Mutex<InputEditor>,
     /// Current pane operational state.
     state: Mutex<PaneState>,
-    /// Current input mode (Agent or Terminal).
-    input_mode: Mutex<InputMode>,
     /// The pending permission request ID (when in AwaitingPermission state).
     pending_permission: Mutex<Option<PendingPermission>>,
     /// Full-screen layout state (dimensions, model, tokens, etc.).
     screen: Mutex<ScreenState>,
+    /// Block manager — tracks agent response / command blocks for navigation.
+    block_manager: Mutex<BlockManager>,
+    /// Last Active AI detection — populated when errors are found in command output.
+    /// Consumed by Ctrl+F to build a quick-fix prompt.
+    last_detection: Mutex<Option<LastDetection>>,
+    /// Shared content detector — pre-compiled regexes.
+    detector: ContentDetector,
+    /// Next-command suggester.
+    suggester: NextCommandSuggester,
 }
 
 /// A pending permission request waiting for user approval.
@@ -152,11 +175,14 @@ impl ElwoodPane {
             seqno: AtomicUsize::new(0),
             dead: Mutex::new(false),
             title: Mutex::new("Elwood Agent".into()),
-            input_buffer: Mutex::new(String::new()),
+            input_editor: Mutex::new(InputEditor::new(InputMode::default())),
             state: Mutex::new(PaneState::Idle),
-            input_mode: Mutex::new(InputMode::default()),
             pending_permission: Mutex::new(None),
             screen: Mutex::new(screen_state),
+            block_manager: Mutex::new(BlockManager::new()),
+            last_detection: Mutex::new(None),
+            detector: ContentDetector::new(),
+            suggester: NextCommandSuggester::new(),
         };
 
         // Render the full-screen TUI layout (includes welcome message)
@@ -281,8 +307,31 @@ impl ElwoodPane {
                             ss.task_elapsed_frozen = ss.task_start
                                 .map(|s| s.elapsed().as_secs());
                             ss.task_start = None;
+                            // Close the current agent block (exit 0 — successful turn)
+                            self.block_manager.lock().finish_block(Some(0));
                         }
-                        AgentResponse::CommandOutput { .. } => {
+                        AgentResponse::CommandOutput {
+                            command,
+                            stdout,
+                            stderr,
+                            exit_code,
+                        } => {
+                            let code = *exit_code;
+                            let success = code == Some(0);
+
+                            // ── Active AI: run observer detection ──────────
+                            // Combine stdout + stderr into a single line list for the detector.
+                            let combined: String = if stderr.is_empty() {
+                                stdout.clone()
+                            } else if stdout.is_empty() {
+                                stderr.clone()
+                            } else {
+                                format!("{stdout}\n{stderr}")
+                            };
+                            let lines: Vec<String> =
+                                combined.lines().map(|l| l.to_string()).collect();
+                            let detections = self.detector.detect(self.pane_id, &lines, Instant::now());
+
                             *self.state.lock() = PaneState::Idle;
                             let mut ss = self.screen.lock();
                             ss.is_running = false;
@@ -291,6 +340,43 @@ impl ElwoodPane {
                             ss.task_elapsed_frozen = ss.task_start
                                 .map(|s| s.elapsed().as_secs());
                             ss.task_start = None;
+                            drop(ss);
+
+                            // Close the current block with the shell exit code
+                            self.block_manager.lock().finish_block(code);
+
+                            // Store the primary detection for Ctrl+F quick-fix
+                            let primary = detections.first();
+                            *self.last_detection.lock() = primary.map(|d| {
+                                let label = match d.content_type {
+                                    ContentType::CompilerError => "Compiler error",
+                                    ContentType::TestFailure => "Test failure",
+                                    ContentType::StackTrace => "Stack trace",
+                                    ContentType::CommandOutput => "Command error",
+                                    ContentType::Unknown => "Error",
+                                };
+                                LastDetection {
+                                    command: command.clone(),
+                                    output: combined.clone(),
+                                    label: label.to_string(),
+                                    source_file: d.source_file.clone(),
+                                }
+                            });
+
+                            // Render Active AI suggestion if errors detected
+                            if let Some(d) = primary {
+                                let label = match d.content_type {
+                                    ContentType::CompilerError => "Compiler error",
+                                    ContentType::TestFailure => "Test failure",
+                                    ContentType::StackTrace => "Stack trace",
+                                    ContentType::CommandOutput => "Command error",
+                                    ContentType::Unknown => "Error",
+                                };
+                                self.write_ansi(&screen::format_suggestion(label));
+                            } else if let Some(suggestion) = self.suggester.suggest(command, success) {
+                                // No errors but there is a next-command suggestion
+                                self.write_ansi(&screen::format_next_command_suggestion(suggestion));
+                            }
                         }
                         AgentResponse::Error(_) => {
                             *self.state.lock() = PaneState::Idle;
@@ -365,37 +451,32 @@ impl ElwoodPane {
     /// Toggle between Agent and Terminal input modes.
     fn toggle_input_mode(&self) {
         let new_mode = {
-            let mut mode = self.input_mode.lock();
-            *mode = match *mode {
+            let mut editor = self.input_editor.lock();
+            let new = match editor.mode() {
                 InputMode::Agent => InputMode::Terminal,
                 InputMode::Terminal => InputMode::Agent,
             };
-            *mode
+            editor.set_mode(new);
+            new
         };
 
         // Sync to screen state and refresh chrome
-        self.screen.lock().input_mode = new_mode;
+        let mut ss = self.screen.lock();
+        ss.input_mode = new_mode;
+        drop(ss);
         self.refresh_input_box();
         self.refresh_status_bar();
     }
 
     /// Submit the current input buffer as a shell command.
     fn submit_command(&self) {
-        let command = {
-            let mut buf = self.input_buffer.lock();
-            let cmd = buf.clone();
-            buf.clear();
-            cmd
+        let command = match self.input_editor.lock().submit() {
+            Some(c) => c,
+            None => return,
         };
 
-        if command.is_empty() {
-            return;
-        }
-
-        // Clear input box
-        {
-            self.screen.lock().input_text.clear();
-        }
+        // Clear input box screen state
+        self.sync_editor_to_screen();
         self.refresh_input_box();
 
         // Write "$ command" prompt into chat area
@@ -423,22 +504,13 @@ impl ElwoodPane {
 
     /// Submit the current input buffer as a message to the agent.
     fn submit_input(&self) {
-        let content = {
-            let mut buf = self.input_buffer.lock();
-            let content = buf.clone();
-            buf.clear();
-            content
+        let content = match self.input_editor.lock().submit() {
+            Some(c) => c,
+            None => return,
         };
 
-        if content.is_empty() {
-            return;
-        }
-
-        // Clear input box
-        {
-            let mut ss = self.screen.lock();
-            ss.input_text.clear();
-        }
+        // Clear input box screen state
+        self.sync_editor_to_screen();
         self.refresh_input_box();
 
         // Write user prompt into chat area (scroll region)
@@ -459,6 +531,154 @@ impl ElwoodPane {
 
         // Send to agent via bridge
         let _ = self.bridge.send_request(AgentRequest::SendMessage { content });
+    }
+
+    /// Sync the InputEditor's current state into ScreenState for rendering.
+    fn sync_editor_to_screen(&self) {
+        let editor = self.input_editor.lock();
+        let mut ss = self.screen.lock();
+        ss.input_lines = editor.lines().to_vec();
+        ss.cursor_row = editor.cursor_row();
+        ss.cursor_col = editor.cursor_col();
+        // Keep legacy field in sync for single-line fallback
+        ss.input_text = editor.lines().first().cloned().unwrap_or_default();
+    }
+
+    // ── Active AI quick-fix ─────────────────────────────────────────────────
+
+    /// Handle `Ctrl+F` — send the last detected error to the agent with a fix prompt.
+    ///
+    /// If there is no pending detection (i.e. the last command succeeded without
+    /// errors), this is a no-op with a brief informational message.
+    fn handle_quick_fix(&self) {
+        let detection = self.last_detection.lock().take();
+        match detection {
+            None => {
+                // Nothing to fix — tell the user
+                // INFO color: #7DCFFF = rgb(125, 207, 255) — matches screen.rs INFO constant
+                let info = "\x1b[38;2;125;207;255m";
+                self.write_ansi(&format!(
+                    "\r\n{info}  [!] No error detected from last command. Run a command first, then press Ctrl+F.\x1b[0m\r\n",
+                ));
+            }
+            Some(det) => {
+                // Build a fix prompt that includes the command, output, and file context
+                let file_ctx = det
+                    .source_file
+                    .as_deref()
+                    .map(|f| format!(" in `{f}`"))
+                    .unwrap_or_default();
+
+                let prompt = format!(
+                    "Fix the {label}{file_ctx}.\n\nCommand: `{command}`\n\nOutput:\n```\n{output}\n```\n\nPlease identify the root cause and apply a fix.",
+                    label = det.label,
+                    file_ctx = file_ctx,
+                    command = det.command,
+                    output = if det.output.len() > 4096 {
+                        &det.output[..4096]
+                    } else {
+                        &det.output
+                    },
+                );
+
+                // Echo the intent into the chat area so the user knows what was sent
+                self.write_ansi(&screen::format_user_prompt(&format!(
+                    "[Quick Fix] {}{}",
+                    det.label, file_ctx
+                )));
+                self.write_ansi(&screen::format_assistant_prefix());
+
+                // Mark as running and send to agent
+                {
+                    let mut ss = self.screen.lock();
+                    ss.is_running = true;
+                    ss.task_start = Some(Instant::now());
+                    ss.task_elapsed_frozen = None;
+                }
+                *self.state.lock() = PaneState::Running;
+
+                let _ = self.bridge.send_request(AgentRequest::SendMessage { content: prompt });
+            }
+        }
+        self.refresh_status_bar();
+    }
+
+    // ── Block navigation ────────────────────────────────────────────────────
+
+    /// Return the current cursor row in the virtual terminal (stable index).
+    fn current_row(&self) -> StableRowIndex {
+        let mut terminal = self.terminal.lock();
+        terminal_get_cursor_position(&mut terminal).y
+    }
+
+    /// Navigate to the previous block (Ctrl+Up).
+    fn navigate_block_prev(&self) {
+        let current = self.current_row();
+        if let Some(target_row) = self.block_manager.lock().navigate_prev(current) {
+            self.scroll_to_row(target_row);
+        }
+    }
+
+    /// Navigate to the next block (Ctrl+Down).
+    fn navigate_block_next(&self) {
+        let current = self.current_row();
+        if let Some(target_row) = self.block_manager.lock().navigate_next(current) {
+            self.scroll_to_row(target_row);
+        }
+    }
+
+    /// Scroll the virtual terminal so that `row` is approximately visible.
+    ///
+    /// Emits a cursor-positioning escape; the WezTerm renderer follows the
+    /// cursor position when re-drawing the pane.
+    fn scroll_to_row(&self, row: StableRowIndex) {
+        let ss = self.screen.lock();
+        let chat_top = ss.chat_top();
+        let chat_bottom = ss.chat_bottom();
+        let height = ss.height.max(1);
+        drop(ss);
+
+        let visible_row = row.max(0) as u16;
+        let target_row = (chat_top + visible_row % height)
+            .min(chat_bottom)
+            .max(chat_top);
+
+        let escape = format!("\x1b[s\x1b[{};1H\x1b[u", target_row);
+        self.write_ansi(&escape);
+    }
+
+    /// Copy the output zone of the block at the current cursor row.
+    ///
+    /// Writes a brief confirmation message into the chat area.  Full clipboard
+    /// integration requires access to the WezTerm clipboard API (wezterm-gui);
+    /// that is left as a comment for future wiring.
+    fn copy_current_block_output(&self) {
+        let current = self.current_row();
+        let output_text = {
+            let mgr = self.block_manager.lock();
+            mgr.get_block_at_row(current)
+                .and_then(|b| b.output_zone)
+                .map(|z| {
+                    let mut terminal = self.terminal.lock();
+                    let (_, lines) = terminal_get_lines(&mut terminal, z.start_y..z.end_y + 1);
+                    lines
+                        .iter()
+                        .map(|l| l.as_str().to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+        };
+
+        if let Some(text) = output_text {
+            let msg = format!(
+                "\r\n\x1b[2m[Copied {} bytes from block]\x1b[0m\r\n",
+                text.len(),
+            );
+            self.write_ansi(&msg);
+            // Future: pass `text` to the clipboard via a callback registered
+            // at ElwoodDomain construction time.
+            let _ = text;
+        }
     }
 }
 
@@ -559,12 +779,18 @@ impl mux::pane::Pane for ElwoodPane {
     }
 
     fn send_paste(&self, text: &str) -> anyhow::Result<()> {
-        // Treat pasted text as input — add to buffer and update input box
+        // Treat pasted text as input — insert each character into the editor
         {
-            self.input_buffer.lock().push_str(text);
-            let buf = self.input_buffer.lock().clone();
-            self.screen.lock().input_text = buf;
+            let mut editor = self.input_editor.lock();
+            for ch in text.chars() {
+                if ch == '\n' || ch == '\r' {
+                    editor.insert_newline();
+                } else {
+                    editor.insert_char(ch);
+                }
+            }
         }
+        self.sync_editor_to_screen();
         self.refresh_input_box();
         Ok(())
     }
@@ -630,18 +856,37 @@ impl mux::pane::Pane for ElwoodPane {
             return Ok(());
         }
 
+        // Ctrl+F: quick-fix — send last detected error to the agent
+        if key == KeyCode::Char('f') && mods == KeyModifiers::CTRL {
+            self.handle_quick_fix();
+            return Ok(());
+        }
+
+        let mut editor_changed = true;
+
         match key {
+            // ── Submit ───────────────────────────────────────────────
             KeyCode::Enter if mods.is_empty() => {
-                let mode = *self.input_mode.lock();
+                let mode = self.input_editor.lock().mode();
                 match mode {
                     InputMode::Agent => {
                         // Check for `!` prefix — run as command
-                        let starts_with_bang = self.input_buffer.lock().starts_with('!');
+                        let starts_with_bang = self
+                            .input_editor
+                            .lock()
+                            .lines()
+                            .first()
+                            .map(|l| l.starts_with('!'))
+                            .unwrap_or(false);
                         if starts_with_bang {
-                            // Strip the `!` prefix before submitting as command
+                            // Strip the leading `!` from the first line
                             {
-                                let mut buf = self.input_buffer.lock();
-                                *buf = buf.trim_start_matches('!').to_string();
+                                let mut ed = self.input_editor.lock();
+                                let first = ed.lines()[0].trim_start_matches('!').to_string();
+                                ed.clear();
+                                for c in first.chars() {
+                                    ed.insert_char(c);
+                                }
                             }
                             self.submit_command();
                         } else {
@@ -652,33 +897,107 @@ impl mux::pane::Pane for ElwoodPane {
                         self.submit_command();
                     }
                 }
+                editor_changed = false; // sync already done in submit_*
             }
-            KeyCode::Char(c) if mods.is_empty() || mods == KeyModifiers::SHIFT => {
-                // Add character to input buffer and update the input box
-                self.input_buffer.lock().push(c);
-                {
-                    let buf = self.input_buffer.lock().clone();
-                    self.screen.lock().input_text = buf;
-                }
-                self.refresh_input_box();
+
+            // ── Multi-line newline (Shift+Enter) ─────────────────────
+            KeyCode::Enter if mods == KeyModifiers::SHIFT => {
+                self.input_editor.lock().insert_newline();
             }
-            KeyCode::Backspace if mods.is_empty() => {
-                let mut buf = self.input_buffer.lock();
-                if buf.pop().is_some() {
-                    let new_text = buf.clone();
-                    drop(buf);
-                    self.screen.lock().input_text = new_text;
-                    self.refresh_input_box();
-                }
-            }
+
+            // ── Cancel ───────────────────────────────────────────────
             KeyCode::Escape => {
-                // Cancel current operation
                 let _ = self.bridge.send_request(AgentRequest::Cancel);
+                editor_changed = false;
             }
+
+            // ── Backspace ────────────────────────────────────────────
+            KeyCode::Backspace if mods.is_empty() => {
+                self.input_editor.lock().backspace();
+            }
+
+            // ── Delete word backward (Ctrl+W) ────────────────────────
+            KeyCode::Char('w') if mods == KeyModifiers::CTRL => {
+                self.input_editor.lock().delete_word_backward();
+            }
+
+            // ── Delete to line start (Ctrl+U) ────────────────────────
+            KeyCode::Char('u') if mods == KeyModifiers::CTRL => {
+                self.input_editor.lock().delete_to_line_start();
+            }
+
+            // ── Start of line (Ctrl+A or Home) ────────────────────────
+            KeyCode::Char('a') if mods == KeyModifiers::CTRL => {
+                self.input_editor.lock().move_to_line_start();
+            }
+            KeyCode::Home if mods.is_empty() => {
+                self.input_editor.lock().move_to_line_start();
+            }
+
+            // ── End of line (Ctrl+E or End) ───────────────────────────
+            KeyCode::Char('e') if mods == KeyModifiers::CTRL => {
+                self.input_editor.lock().move_to_line_end();
+            }
+            KeyCode::End if mods.is_empty() => {
+                self.input_editor.lock().move_to_line_end();
+            }
+
+            // ── Cursor left ───────────────────────────────────────────
+            KeyCode::LeftArrow if mods.is_empty() => {
+                self.input_editor.lock().move_left();
+            }
+
+            // ── Cursor right ──────────────────────────────────────────
+            KeyCode::RightArrow if mods.is_empty() => {
+                self.input_editor.lock().move_right();
+            }
+
+            // ── Cursor up / history prev ──────────────────────────────
+            KeyCode::UpArrow if mods.is_empty() => {
+                self.input_editor.lock().move_up();
+            }
+
+            // ── Cursor down / history next ────────────────────────────
+            KeyCode::DownArrow if mods.is_empty() => {
+                self.input_editor.lock().move_down();
+            }
+
+            // ── Delete word backward (Alt+Backspace) ──────────────────
+            KeyCode::Backspace if mods == KeyModifiers::ALT => {
+                self.input_editor.lock().delete_word_backward();
+            }
+
+            // ── Block navigation (Ctrl+Up / Ctrl+Down) ───────────────
+            KeyCode::UpArrow if mods == KeyModifiers::CTRL => {
+                self.navigate_block_prev();
+                editor_changed = false;
+            }
+            KeyCode::DownArrow if mods == KeyModifiers::CTRL => {
+                self.navigate_block_next();
+                editor_changed = false;
+            }
+
+            // ── Copy current block output (Ctrl+Shift+C) ─────────────
+            KeyCode::Char('c') if mods == KeyModifiers::CTRL | KeyModifiers::SHIFT => {
+                self.copy_current_block_output();
+                editor_changed = false;
+            }
+
+            // ── Regular character input ───────────────────────────────
+            KeyCode::Char(c) if mods.is_empty() || mods == KeyModifiers::SHIFT => {
+                self.input_editor.lock().insert_char(c);
+            }
+
             _ => {
-                // Unhandled key
+                editor_changed = false;
             }
         }
+
+        if editor_changed {
+            self.sync_editor_to_screen();
+            self.refresh_input_box();
+        }
+
         Ok(())
     }
 

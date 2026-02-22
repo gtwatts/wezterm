@@ -549,6 +549,140 @@ pub struct PaneInfo {
 
 use mux::domain::DomainId;
 
+// ─── Next-command Suggester ─────────────────────────────────────────────────
+
+/// A rule mapping a command prefix pattern to a suggestion string.
+struct NextCommandRule {
+    /// The prefix the last command must start with (case-insensitive).
+    prefix: &'static str,
+    /// The human-readable suggestion shown to the user.
+    suggestion: &'static str,
+}
+
+/// Suggests likely follow-up commands based on the previous command and exit code.
+///
+/// This is a simple, zero-allocation rule table: the first matching rule wins.
+/// All matching is case-insensitive on the command prefix so both `git add` and
+/// `GIT ADD` trigger the same suggestion.
+///
+/// # Examples
+///
+/// ```rust
+/// let s = elwood_bridge::observer::NextCommandSuggester::new();
+/// // git add -> git commit suggestion
+/// assert!(s.suggest("git add .", true).is_some());
+/// // cargo build error -> apply fix suggestion
+/// assert!(s.suggest("cargo build", false).is_some());
+/// // Unknown command — no suggestion
+/// assert!(s.suggest("ls -la", true).is_none());
+/// ```
+pub struct NextCommandSuggester {
+    success_rules: Vec<NextCommandRule>,
+    failure_rules: Vec<NextCommandRule>,
+}
+
+impl NextCommandSuggester {
+    /// Create a new suggester with the built-in rule table.
+    pub fn new() -> Self {
+        Self {
+            success_rules: vec![
+                NextCommandRule {
+                    prefix: "git add",
+                    suggestion: "git commit -m \"<message>\"",
+                },
+                NextCommandRule {
+                    prefix: "git commit",
+                    suggestion: "git push",
+                },
+                NextCommandRule {
+                    prefix: "git clone",
+                    suggestion: "cd <repo> && ls",
+                },
+                NextCommandRule {
+                    prefix: "cargo build",
+                    suggestion: "cargo run",
+                },
+                NextCommandRule {
+                    prefix: "cargo test",
+                    suggestion: "cargo clippy -- -D warnings",
+                },
+                NextCommandRule {
+                    prefix: "npm install",
+                    suggestion: "npm run build",
+                },
+                NextCommandRule {
+                    prefix: "npm run build",
+                    suggestion: "npm run test",
+                },
+                NextCommandRule {
+                    prefix: "make",
+                    suggestion: "make test",
+                },
+                NextCommandRule {
+                    prefix: "docker build",
+                    suggestion: "docker run <image>",
+                },
+                NextCommandRule {
+                    prefix: "cd ",
+                    suggestion: "ls  (or git status to check repo state)",
+                },
+            ],
+            failure_rules: vec![
+                NextCommandRule {
+                    prefix: "cargo build",
+                    suggestion: "Press Ctrl+F to ask Elwood to fix the compiler errors",
+                },
+                NextCommandRule {
+                    prefix: "cargo test",
+                    suggestion: "Press Ctrl+F to ask Elwood to fix the failing tests",
+                },
+                NextCommandRule {
+                    prefix: "cargo clippy",
+                    suggestion: "Press Ctrl+F to ask Elwood to resolve the lint warnings",
+                },
+                NextCommandRule {
+                    prefix: "make",
+                    suggestion: "Press Ctrl+F to ask Elwood to diagnose the build failure",
+                },
+                NextCommandRule {
+                    prefix: "npm run",
+                    suggestion: "Press Ctrl+F to ask Elwood to fix the npm script error",
+                },
+                NextCommandRule {
+                    prefix: "python",
+                    suggestion: "Press Ctrl+F to ask Elwood to fix the Python error",
+                },
+                NextCommandRule {
+                    prefix: "pytest",
+                    suggestion: "Press Ctrl+F to ask Elwood to fix the failing tests",
+                },
+            ],
+        }
+    }
+
+    /// Suggest a follow-up action given the command that just ran and whether it succeeded.
+    ///
+    /// Returns `Some(&str)` with the suggestion text if a rule matched, or `None`.
+    pub fn suggest(&self, command: &str, success: bool) -> Option<&str> {
+        let lower = command.to_lowercase();
+        let rules = if success {
+            &self.success_rules
+        } else {
+            &self.failure_rules
+        };
+        rules
+            .iter()
+            .find(|rule| lower.starts_with(rule.prefix))
+            .map(|rule| rule.suggestion)
+    }
+}
+
+impl Default for NextCommandSuggester {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -805,5 +939,76 @@ exit code: 1"#;
             .as_deref()
             .expect("has file")
             .contains("page.tsx"));
+    }
+
+    // ---- NextCommandSuggester ----
+
+    #[test]
+    fn suggests_git_commit_after_git_add() {
+        let s = NextCommandSuggester::new();
+        let suggestion = s.suggest("git add .", true);
+        assert!(suggestion.is_some());
+        assert!(suggestion.unwrap().contains("git commit"));
+    }
+
+    #[test]
+    fn suggests_git_push_after_git_commit() {
+        let s = NextCommandSuggester::new();
+        let suggestion = s.suggest("git commit -m \"fix bug\"", true);
+        assert!(suggestion.is_some());
+        assert!(suggestion.unwrap().contains("git push"));
+    }
+
+    #[test]
+    fn suggests_cargo_run_after_successful_cargo_build() {
+        let s = NextCommandSuggester::new();
+        let suggestion = s.suggest("cargo build --release", true);
+        assert!(suggestion.is_some());
+        assert!(suggestion.unwrap().contains("cargo run"));
+    }
+
+    #[test]
+    fn suggests_fix_after_failed_cargo_build() {
+        let s = NextCommandSuggester::new();
+        let suggestion = s.suggest("cargo build", false);
+        assert!(suggestion.is_some());
+        assert!(suggestion.unwrap().contains("Ctrl+F"));
+    }
+
+    #[test]
+    fn suggests_fix_after_failed_cargo_test() {
+        let s = NextCommandSuggester::new();
+        let suggestion = s.suggest("cargo test --workspace", false);
+        assert!(suggestion.is_some());
+        assert!(suggestion.unwrap().contains("Ctrl+F"));
+    }
+
+    #[test]
+    fn no_suggestion_for_unknown_success_command() {
+        let s = NextCommandSuggester::new();
+        let suggestion = s.suggest("ls -la", true);
+        assert!(suggestion.is_none());
+    }
+
+    #[test]
+    fn no_suggestion_for_unknown_failed_command() {
+        let s = NextCommandSuggester::new();
+        let suggestion = s.suggest("echo hello", false);
+        assert!(suggestion.is_none());
+    }
+
+    #[test]
+    fn suggest_is_case_insensitive() {
+        let s = NextCommandSuggester::new();
+        // Upper-case prefix should still match
+        let suggestion = s.suggest("GIT ADD .", true);
+        assert!(suggestion.is_some());
+        assert!(suggestion.unwrap().contains("git commit"));
+    }
+
+    #[test]
+    fn suggester_default_works() {
+        let s = NextCommandSuggester::default();
+        assert!(s.suggest("cargo build", false).is_some());
     }
 }

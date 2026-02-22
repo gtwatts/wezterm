@@ -134,7 +134,13 @@ pub struct ScreenState {
     pub tool_start: Option<Instant>,
     pub task_start: Option<Instant>,
     pub task_elapsed_frozen: Option<u64>,
+    /// Deprecated single-line input text (kept for backwards compat with existing rendering path).
     pub input_text: String,
+    /// Multi-line input lines (from InputEditor).  If non-empty, takes precedence over `input_text`.
+    pub input_lines: Vec<String>,
+    /// Cursor position within the multi-line editor (row, col as visible char index).
+    pub cursor_row: usize,
+    pub cursor_col: usize,
     /// Current input mode (Agent or Terminal).
     pub input_mode: InputMode,
     /// True when agent is running (for status display).
@@ -164,6 +170,9 @@ impl Default for ScreenState {
             task_start: None,
             task_elapsed_frozen: None,
             input_text: String::new(),
+            input_lines: Vec::new(),
+            cursor_row: 0,
+            cursor_col: 0,
             input_mode: InputMode::default(),
             is_running: false,
             awaiting_permission: false,
@@ -172,9 +181,23 @@ impl Default for ScreenState {
 }
 
 impl ScreenState {
-    /// Rows reserved for header (1) + input area (4) + status bar (1).
+    /// Number of content lines currently in the input editor (at least 1).
+    fn input_content_lines(&self) -> u16 {
+        if self.input_lines.is_empty() {
+            1
+        } else {
+            (self.input_lines.len() as u16).min(8)
+        }
+    }
+
+    /// Total rows the input box occupies: top border + content lines + bottom border.
+    pub fn input_box_height(&self) -> u16 {
+        self.input_content_lines() + 2 // top border + content + bottom border
+    }
+
+    /// Rows reserved for header (1) + input box (variable) + status bar (1).
     pub fn chrome_height(&self) -> u16 {
-        6
+        1 + self.input_box_height() + 1
     }
 
     /// First row of the chat area (1-based).
@@ -184,12 +207,14 @@ impl ScreenState {
 
     /// Last row of the chat area (1-based).
     pub fn chat_bottom(&self) -> u16 {
-        self.height.saturating_sub(5) // Leave 4 for input + 1 for status
+        // Leave room for input box + status bar
+        self.height.saturating_sub(self.input_box_height() + 1)
     }
 
     /// First row of the input area (1-based).
     pub fn input_top(&self) -> u16 {
-        self.height.saturating_sub(4)
+        // Input starts after chat area; status bar is the last row
+        self.height.saturating_sub(self.input_box_height())
     }
 
     /// Status bar row (1-based).
@@ -343,12 +368,21 @@ pub fn render_header(state: &ScreenState) -> String {
     out
 }
 
-/// Render the input box (rows: input_top to input_top+3).
+/// Render the input box (rows: input_top .. input_top + input_box_height - 1).
 ///
+/// Single-line example:
 /// ```text
 /// ╭─ Message (Enter send, Esc cancel) ────────────╮
 /// │ Type a message...                              │
-/// │                                                │
+/// ╰────────────────────────────────────────────────╯
+/// ```
+///
+/// Multi-line example (3 lines):
+/// ```text
+/// ╭─ Message (Shift+Enter newline, Enter send) ────╮
+/// │ 1│ first line of the message                   │
+/// │ 2│ second line                                 │
+/// │ 3│ third line_                                 │
 /// ╰────────────────────────────────────────────────╯
 /// ```
 pub fn render_input_box(state: &ScreenState) -> String {
@@ -357,51 +391,103 @@ pub fn render_input_box(state: &ScreenState) -> String {
     let r = RESET;
 
     // Mode-dependent styling
-    let (border_color, title, placeholder) = match state.input_mode {
-        InputMode::Agent => (ACCENT, " Message (Enter send, Esc cancel) ", "Type a message..."),
-        InputMode::Terminal => (WARNING, " Command (Enter run, Ctrl+T agent) ", "Type a command..."),
+    let (border_color, title_single, title_multi, placeholder) = match state.input_mode {
+        InputMode::Agent => (
+            ACCENT,
+            " Message (Enter send, Esc cancel) ",
+            " Message (Shift+Enter newline, Enter send) ",
+            "Type a message...",
+        ),
+        InputMode::Terminal => (
+            WARNING,
+            " Command (Enter run, Ctrl+T agent) ",
+            " Command (Shift+Enter newline, Enter run) ",
+            "Type a command...",
+        ),
     };
     let border = fgc(border_color);
 
+    // Determine whether we are in multi-line mode
+    let content_lines = state.input_content_lines() as usize;
+    let is_multiline = content_lines > 1;
+    let title = if is_multiline { title_multi } else { title_single };
+
+    // Top border with title
     let title_len = title.len();
     let fill_len = w.saturating_sub(title_len + 3);
     let fill: String = std::iter::repeat(BOX_H).take(fill_len).collect();
 
     let mut out = String::new();
-
-    // Top border with title
     out.push_str(&goto(top, 1));
     out.push_str(&format!("{border}{BOX_TL}{BOX_H}{r}{border}{BOLD}{title}{r}{border}{fill}{BOX_TR}{r}"));
 
-    // Content line 1 (input text or placeholder)
-    out.push_str(&goto(top + 1, 1));
-    let inner_w = w.saturating_sub(4);
-    let placeholder_len = placeholder.len();
-    if state.input_text.is_empty() {
-        out.push_str(&format!(
-            "{border}{BOX_V}{r} {}{DIM}{placeholder}{r}{}",
-            fgc(MUTED),
-            " ".repeat(inner_w.saturating_sub(placeholder_len)),
-        ));
-    } else {
-        let display: String = state.input_text.chars().take(inner_w).collect();
-        let pad = inner_w.saturating_sub(display.len());
-        out.push_str(&format!(
-            "{border}{BOX_V}{r} {}{display}{}",
-            fgc(FG), " ".repeat(pad),
-        ));
-    }
-    out.push_str(&format!(" {border}{BOX_V}{r}"));
+    // Content rows
+    let inner_w = w.saturating_sub(4); // "│ " + content + " │"
 
-    // Content line 2 (empty)
-    out.push_str(&goto(top + 2, 1));
-    out.push_str(&format!(
-        "{border}{BOX_V}{r}{}  {border}{BOX_V}{r}",
-        " ".repeat(w.saturating_sub(4)),
-    ));
+    if is_multiline {
+        // Multi-line: show line numbers, highlight cursor line
+        let lines = &state.input_lines;
+        // Line number gutter width: enough for the digit count + "│ "
+        let gutter = format!("{content_lines}").len(); // e.g. 2 for 10+ lines
+
+        for (row_idx, line_text) in lines.iter().enumerate().take(8) {
+            let is_cursor_row = row_idx == state.cursor_row;
+            let row_num = row_idx + 1;
+
+            // Gutter: " N│"
+            let gutter_str = format!("{:>gutter$}", row_num);
+            let gutter_color = if is_cursor_row { fgc(ACCENT) } else { fgc(MUTED) };
+            let line_bg = if is_cursor_row {
+                bgc(SELECTION)
+            } else {
+                String::new()
+            };
+            let line_bg_reset = if is_cursor_row { RESET } else { "" };
+
+            // Available width for content after gutter (gutter + "│ " = gutter+2 chars)
+            let content_w = inner_w.saturating_sub(gutter + 2);
+
+            // Truncate display text to available width
+            let display: String = line_text.chars().take(content_w).collect();
+            let pad = content_w.saturating_sub(display.chars().count());
+
+            out.push_str(&goto(top + 1 + row_idx as u16, 1));
+            out.push_str(&format!(
+                "{border}{BOX_V}{r}{line_bg} {gutter_color}{gutter_str}{r}{line_bg}{gutter_color}│{r} {line_bg}{}{display}{}{line_bg_reset} {border}{BOX_V}{r}",
+                fgc(FG),
+                " ".repeat(pad),
+            ));
+        }
+    } else {
+        // Single-line: show text or placeholder
+        out.push_str(&goto(top + 1, 1));
+        let use_text = if state.input_lines.is_empty() {
+            &state.input_text
+        } else {
+            &state.input_lines[0]
+        };
+        let placeholder_len = placeholder.chars().count();
+        if use_text.is_empty() {
+            out.push_str(&format!(
+                "{border}{BOX_V}{r} {}{DIM}{placeholder}{r}{}",
+                fgc(MUTED),
+                " ".repeat(inner_w.saturating_sub(placeholder_len)),
+            ));
+        } else {
+            let display: String = use_text.chars().take(inner_w).collect();
+            let pad = inner_w.saturating_sub(display.chars().count());
+            out.push_str(&format!(
+                "{border}{BOX_V}{r} {}{display}{}",
+                fgc(FG),
+                " ".repeat(pad),
+            ));
+        }
+        out.push_str(&format!(" {border}{BOX_V}{r}"));
+    }
 
     // Bottom border
-    out.push_str(&goto(top + 3, 1));
+    let bot_row = top + 1 + content_lines as u16;
+    out.push_str(&goto(bot_row, 1));
     let bot_fill: String = std::iter::repeat(BOX_H).take(w.saturating_sub(2)).collect();
     out.push_str(&format!("{border}{BOX_BL}{bot_fill}{BOX_BR}{r}"));
 
@@ -745,6 +831,38 @@ pub fn format_command_output(
     out
 }
 
+/// Format an Active AI suggestion line below command output.
+///
+/// Shown when the `ContentDetector` finds compiler errors, test failures, etc.
+/// The user can press `Ctrl+F` to trigger a quick-fix from this suggestion.
+///
+/// # Example output
+///
+/// ```text
+///   💡 Compiler error detected — press Ctrl+F to ask Elwood to fix it
+/// ```
+pub fn format_suggestion(content_type_label: &str) -> String {
+    let info = fgc(INFO);
+    let muted = fgc(MUTED);
+    let key_bg = bgc(SELECTION);
+    let key_fg = fgc(ACCENT);
+    format!(
+        "\r\n{info}  [!]{RESET} {muted}{content_type_label} detected \
+         \u{2014} press {key_bg}{key_fg}{BOLD} Ctrl+F {RESET}{muted} to ask Elwood to fix it{RESET}\r\n",
+    )
+}
+
+/// Format a next-command suggestion line after a successful command.
+///
+/// Shown when the command sequence heuristic fires (e.g. `git add` -> `git commit`).
+pub fn format_next_command_suggestion(suggestion: &str) -> String {
+    let success = fgc(SUCCESS);
+    let muted = fgc(MUTED);
+    format!(
+        "{muted}  [>]{RESET} {success}Next:{RESET} {muted}{suggestion}{RESET}\r\n",
+    )
+}
+
 /// Format a shutdown message.
 pub fn format_shutdown() -> String {
     format!("\r\n{}{ITALIC}Agent session ended.{RESET}\r\n", fgc(MUTED))
@@ -884,10 +1002,67 @@ mod tests {
     }
 
     #[test]
+    fn test_format_suggestion_contains_key_hint() {
+        let s = format_suggestion("Compiler error");
+        assert!(s.contains("Compiler error"));
+        assert!(s.contains("Ctrl+F"));
+        assert!(s.contains("[!]"));
+    }
+
+    #[test]
+    fn test_format_next_command_suggestion() {
+        let s = format_next_command_suggestion("git commit -m \"message\"");
+        assert!(s.contains("Next:"));
+        assert!(s.contains("git commit"));
+        assert!(s.contains("[>]"));
+    }
+
+    #[test]
     fn test_muted_tab_blends() {
         let m = muted_tab(TAB_CHAT);
         // Should be darker than original
         assert!(m.0 < TAB_CHAT.0);
         assert!(m.1 < TAB_CHAT.1);
+    }
+
+    #[test]
+    fn test_render_input_box_multiline() {
+        let mut state = ScreenState { width: 80, height: 24, ..Default::default() };
+        state.input_lines = vec!["line one".into(), "line two".into()];
+        state.cursor_row = 1;
+        let input = render_input_box(&state);
+        assert!(input.contains("line one"));
+        assert!(input.contains("line two"));
+        assert!(input.contains("╭"));
+        assert!(input.contains("╰"));
+    }
+
+    #[test]
+    fn test_input_box_height_grows_with_lines() {
+        let mut state = ScreenState { width: 80, height: 24, ..Default::default() };
+        assert_eq!(state.input_box_height(), 3); // 1 content + top + bottom borders
+
+        state.input_lines = vec!["a".into(), "b".into(), "c".into()];
+        assert_eq!(state.input_box_height(), 5); // 3 content + 2 borders
+    }
+
+    #[test]
+    fn test_chat_bottom_adjusts_for_input_height() {
+        let mut state = ScreenState { width: 80, height: 24, ..Default::default() };
+        let single_bottom = state.chat_bottom();
+
+        state.input_lines = vec!["a".into(), "b".into(), "c".into(), "d".into()];
+        let multi_bottom = state.chat_bottom();
+
+        // Chat area shrinks when input box is taller
+        assert!(multi_bottom < single_bottom);
+    }
+
+    #[test]
+    fn test_input_box_caps_at_8_lines() {
+        let mut state = ScreenState { width: 80, height: 40, ..Default::default() };
+        state.input_lines = (0..20).map(|i| format!("line {i}")).collect();
+        // Height should be capped at 8 content lines + 2 borders = 10
+        assert_eq!(state.input_box_height(), 10);
     }
 }

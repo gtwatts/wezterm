@@ -67,7 +67,7 @@ pub use termwindow::{set_window_class, set_window_position, TermWindow, ICON_DAT
 
 #[derive(Debug, Parser)]
 #[command(
-    about = "Wez's Terminal Emulator\nhttp://github.com/wezterm/wezterm",
+    about = "Elwood Terminal — AI-native terminal emulator\nhttps://github.com/gordonwatts/elwood-pro",
     version = config::wezterm_version()
 )]
 struct Opt {
@@ -123,7 +123,7 @@ enum SubCommand {
     #[command(name = "serial", about = "Open a serial port")]
     Serial(SerialCommand),
 
-    #[command(name = "connect", about = "Connect to wezterm multiplexer")]
+    #[command(name = "connect", about = "Connect to elwood multiplexer")]
     Connect(ConnectCommand),
 
     #[command(name = "ls-fonts", about = "Display information about fonts")]
@@ -452,6 +452,11 @@ async fn async_run_terminal_gui(
         None
     };
 
+    // When Elwood feature is enabled, use the Elwood domain as the primary domain
+    // so the initial pane IS the Elwood agent pane (single-pane architecture).
+    #[cfg(feature = "elwood")]
+    let domain = domain.or_else(|| mux.get_domain_by_name("elwood"));
+
     if !opts.attach {
         trigger_and_log_gui_startup(spawn_command).await;
     }
@@ -489,7 +494,9 @@ async fn async_run_terminal_gui(
             trigger_and_log_gui_attached(MuxDomain(domain.domain_id())).await;
         }
     }
-    spawn_tab_in_domain_if_mux_is_empty(cmd, is_connecting, domain, opts.workspace).await
+    spawn_tab_in_domain_if_mux_is_empty(cmd, is_connecting, domain, opts.workspace).await?;
+
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -620,7 +627,7 @@ impl Publish {
                         Ok(res) => {
                             log::info!(
                                 "Spawned your command via the existing GUI instance. \
-                             Use wezterm start --always-new-process if you do not want this behavior. \
+                             Use elwood start --always-new-process if you do not want this behavior. \
                              Result={:?}",
                                 res
                             );
@@ -812,7 +819,7 @@ fn notify_on_panic() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         if let Some(s) = info.payload().downcast_ref::<&str>() {
-            fatal_toast_notification("Wezterm panic", s);
+            fatal_toast_notification("Elwood Terminal panic", s);
         }
         default_hook(info);
     }));
@@ -820,7 +827,7 @@ fn notify_on_panic() {
 
 fn terminate_with_error_message(err: &str) -> ! {
     log::error!("{}; terminating", err);
-    fatal_toast_notification("Wezterm Error", &err);
+    fatal_toast_notification("Elwood Terminal Error", &err);
     std::process::exit(1);
 }
 
@@ -1182,7 +1189,7 @@ fn run() -> anyhow::Result<()> {
     {
         unsafe {
             ::windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID(
-                ::windows::core::PCWSTR(wide_string("org.wezfurlong.wezterm").as_ptr()),
+                ::windows::core::PCWSTR(wide_string("io.elwoodterminal.elwood").as_ptr()),
             )
             .unwrap();
         }
@@ -1243,7 +1250,7 @@ fn run() -> anyhow::Result<()> {
         Some(sub) => sub,
         None => {
             // Need to fake an argv0
-            let mut argv = vec!["wezterm-gui".to_string()];
+            let mut argv = vec!["elwood".to_string()];
             for a in &config.default_gui_startup_args {
                 argv.push(a.clone());
             }

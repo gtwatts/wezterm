@@ -29,6 +29,9 @@ tracing = "0.1"
 # Elwood core (path dep — outside this workspace)
 elwood-core = { path = "../../../elwood-core" }
 
+# Time
+chrono.workspace = true
+
 # Standard
 anyhow.workspace = true
 dirs-next.workspace = true

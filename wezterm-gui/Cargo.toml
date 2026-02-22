@@ -7,6 +7,10 @@ build = "build.rs"
 resolver = "2"
 publish = false
 
+[[bin]]
+name = "elwood"
+path = "src/main.rs"
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]

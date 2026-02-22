@@ -41,7 +41,7 @@ fn get_github_release_info(uri: &str) -> anyhow::Result<Release> {
         .version(HttpVersion::Http10)
         .header(
             "User-Agent",
-            &format!("wezterm/wezterm-{}", wezterm_version()),
+            &format!("elwood/elwood-{}", wezterm_version()),
         )
         .send(&mut latest)
         .map_err(|e| anyhow!("failed to query github releases: {}", e))?;
@@ -119,7 +119,7 @@ fn set_banner_from_release_info(latest: &Release) {
     let reset = CSI::Sgr(Sgr::Reset);
     let link_off = OperatingSystemCommand::SetHyperlink(None);
     mux.set_banner(Some(format!(
-        "{}{}WezTerm Update Available\r\n{}{}{}{}Click to see what's new{}{}\r\n",
+        "{}{}Elwood Terminal Update Available\r\n{}{}{}{}Click to see what's new{}{}\r\n",
         icon,
         top_line_pos,
         second_line_pos,
@@ -195,7 +195,7 @@ fn update_checker() {
 
                     if force_ui || socks.is_empty() || socks[0] == my_sock {
                         persistent_toast_notification_with_click_to_open_url(
-                            "WezTerm Update Available",
+                            "Elwood Terminal Update Available",
                             "Click to see what's new",
                             &url,
                         );
