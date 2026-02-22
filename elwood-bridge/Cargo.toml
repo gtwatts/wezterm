@@ -1,0 +1,41 @@
+[package]
+name = "elwood-bridge"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Bridge between elwood-core agent and WezTerm terminal emulator"
+
+[dependencies]
+# WezTerm crates (workspace deps)
+mux.workspace = true
+config.workspace = true
+termwiz.workspace = true
+wezterm-term.workspace = true
+wezterm-dynamic.workspace = true
+downcast-rs.workspace = true
+parking_lot.workspace = true
+rangeset.workspace = true
+portable-pty.workspace = true
+url.workspace = true
+
+# Shared async
+async-trait.workspace = true
+flume.workspace = true
+smol.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "macros"] }
+tokio-util = { workspace = true }
+tracing = "0.1"
+
+# Elwood core (path dep — outside this workspace)
+elwood-core = { path = "../../../elwood-core" }
+
+# Standard
+anyhow.workspace = true
+dirs-next.workspace = true
+log.workspace = true
+regex.workspace = true
+serde = { workspace = true, features = ["derive"] }
+toml.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "macros", "test-util"] }

@@ -692,6 +692,16 @@ fn setup_mux(
     );
     mux.set_active_workspace(&default_workspace_name);
     crate::update::load_last_release_info_and_set_banner();
+
+    // Register Elwood AI agent domain
+    #[cfg(feature = "elwood")]
+    {
+        let elwood_domain: Arc<dyn Domain> =
+            Arc::new(elwood_bridge::ElwoodDomain::new());
+        mux.add_domain(&elwood_domain);
+        log::info!("Elwood agent domain registered");
+    }
+
     update_mux_domains(config)?;
 
     let default_name =
