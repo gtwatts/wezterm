@@ -141,6 +141,45 @@ async fn agent_runtime_loop(
                         )));
                         let _ = response_tx.send(AgentResponse::TurnComplete { summary: None });
                     }
+                    AgentRequest::RunCommand { command, working_dir } => {
+                        // Commands still work even without an LLM provider
+                        let tx = response_tx.clone();
+                        tokio::spawn(async move {
+                            let shell = std::env::var("SHELL").unwrap_or_else(|_| "bash".to_string());
+                            let mut cmd = tokio::process::Command::new(&shell);
+                            cmd.arg("-c").arg(&command);
+                            cmd.stdout(std::process::Stdio::piped());
+                            cmd.stderr(std::process::Stdio::piped());
+                            if let Some(ref dir) = working_dir {
+                                cmd.current_dir(dir);
+                            }
+                            let result = tokio::time::timeout(
+                                std::time::Duration::from_secs(300),
+                                cmd.output(),
+                            ).await;
+                            let response = match result {
+                                Ok(Ok(output)) => AgentResponse::CommandOutput {
+                                    command: command.clone(),
+                                    stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+                                    stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+                                    exit_code: output.status.code(),
+                                },
+                                Ok(Err(e)) => AgentResponse::CommandOutput {
+                                    command: command.clone(),
+                                    stdout: String::new(),
+                                    stderr: format!("Failed to execute: {e}"),
+                                    exit_code: Some(-1),
+                                },
+                                Err(_) => AgentResponse::CommandOutput {
+                                    command: command.clone(),
+                                    stdout: String::new(),
+                                    stderr: "Command timed out (5 minute limit)".to_string(),
+                                    exit_code: Some(-1),
+                                },
+                            };
+                            let _ = tx.send(response);
+                        });
+                    }
                     _ => {}
                 }
             }
@@ -211,6 +250,51 @@ async fn agent_runtime_loop(
                     &response_tx,
                 )
                 .await;
+            }
+
+            AgentRequest::RunCommand {
+                command,
+                working_dir,
+            } => {
+                tracing::info!("Running shell command: {command}");
+                let tx = response_tx.clone();
+                tokio::spawn(async move {
+                    let shell = std::env::var("SHELL").unwrap_or_else(|_| "bash".to_string());
+
+                    let mut cmd = tokio::process::Command::new(&shell);
+                    cmd.arg("-c").arg(&command);
+                    cmd.stdout(std::process::Stdio::piped());
+                    cmd.stderr(std::process::Stdio::piped());
+
+                    if let Some(ref dir) = working_dir {
+                        cmd.current_dir(dir);
+                    }
+
+                    let timeout_duration = std::time::Duration::from_secs(300); // 5 minutes
+                    let result = tokio::time::timeout(timeout_duration, cmd.output()).await;
+
+                    let response = match result {
+                        Ok(Ok(output)) => AgentResponse::CommandOutput {
+                            command: command.clone(),
+                            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+                            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+                            exit_code: output.status.code(),
+                        },
+                        Ok(Err(e)) => AgentResponse::CommandOutput {
+                            command: command.clone(),
+                            stdout: String::new(),
+                            stderr: format!("Failed to execute: {e}"),
+                            exit_code: Some(-1),
+                        },
+                        Err(_) => AgentResponse::CommandOutput {
+                            command: command.clone(),
+                            stdout: String::new(),
+                            stderr: "Command timed out (5 minute limit)".to_string(),
+                            exit_code: Some(-1),
+                        },
+                    };
+                    let _ = tx.send(response);
+                });
             }
 
             AgentRequest::Cancel => {

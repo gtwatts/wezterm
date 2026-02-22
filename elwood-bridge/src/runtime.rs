@@ -18,6 +18,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 
+/// Whether the input box is in Agent mode (natural language) or Terminal mode (shell commands).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InputMode {
+    /// Natural language messages sent to the LLM agent.
+    #[default]
+    Agent,
+    /// Shell commands executed via `$SHELL -c`.
+    Terminal,
+}
+
 /// Request from WezTerm (smol-side) to the agent (tokio-side).
 #[derive(Debug, Clone)]
 pub enum AgentRequest {
@@ -30,6 +40,12 @@ pub enum AgentRequest {
 
     /// Send a follow-up message to an active agent session.
     SendMessage { content: String },
+
+    /// Run a shell command (Terminal mode or `!` prefix).
+    RunCommand {
+        command: String,
+        working_dir: Option<String>,
+    },
 
     /// User responded to a permission request.
     PermissionResponse { request_id: String, granted: bool },
@@ -72,6 +88,14 @@ pub enum AgentResponse {
     TurnComplete {
         /// Summary of what was accomplished.
         summary: Option<String>,
+    },
+
+    /// Shell command execution completed.
+    CommandOutput {
+        command: String,
+        stdout: String,
+        stderr: String,
+        exit_code: Option<i32>,
     },
 
     /// An error occurred in the agent.
