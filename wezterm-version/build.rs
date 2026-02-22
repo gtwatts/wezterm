@@ -50,4 +50,6 @@ fn main() {
 
     println!("cargo:rustc-env=WEZTERM_TARGET_TRIPLE={}", target);
     println!("cargo:rustc-env=WEZTERM_CI_TAG={}", ci_tag);
+    println!("cargo:rustc-env=ELWOOD_TARGET_TRIPLE={}", target);
+    println!("cargo:rustc-env=ELWOOD_CI_TAG={}", ci_tag);
 }

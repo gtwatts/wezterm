@@ -33,8 +33,14 @@ elwood-core = { path = "../../../elwood-core" }
 chrono.workspace = true
 
 # Standard
+# Unix process isolation for MCP server subprocesses
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+# Standard
 anyhow.workspace = true
 dirs-next.workspace = true
+serde_json.workspace = true
 log.workspace = true
 regex.workspace = true
 serde = { workspace = true, features = ["derive"] }

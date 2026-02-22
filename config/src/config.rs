@@ -1008,8 +1008,11 @@ impl Config {
 
         let mut paths = vec![PathPossibility::optional(HOME_DIR.join(".elwood/config.lua"))];
         for dir in CONFIG_DIRS.iter() {
-            paths.push(PathPossibility::optional(dir.join("elwood/config.lua")))
+            paths.push(PathPossibility::optional(dir.join("config.lua")))
         }
+        // Legacy wezterm config paths for backward compatibility
+        paths.push(PathPossibility::optional(HOME_DIR.join(".wezterm.lua")));
+        paths.push(PathPossibility::optional(HOME_DIR.join(".config/wezterm/wezterm.lua")));
 
         if cfg!(windows) {
             // On Windows, a common use case is to maintain a thumb drive
@@ -1026,8 +1029,11 @@ impl Config {
                 }
             }
         }
-        if let Some(path) = std::env::var_os("WEZTERM_CONFIG_FILE") {
-            log::trace!("Note: WEZTERM_CONFIG_FILE is set in the environment");
+        // Check ELWOOD_CONFIG_FILE first, fall back to WEZTERM_CONFIG_FILE
+        if let Some(path) = std::env::var_os("ELWOOD_CONFIG_FILE")
+            .or_else(|| std::env::var_os("WEZTERM_CONFIG_FILE"))
+        {
+            log::trace!("Note: ELWOOD/WEZTERM_CONFIG_FILE is set in the environment");
             paths.insert(0, PathPossibility::required(path.into()));
         }
 
@@ -1060,6 +1066,8 @@ impl Config {
         // state.
         std::env::remove_var("WEZTERM_CONFIG_FILE");
         std::env::remove_var("WEZTERM_CONFIG_DIR");
+        std::env::remove_var("ELWOOD_CONFIG_FILE");
+        std::env::remove_var("ELWOOD_CONFIG_DIR");
 
         match Self::try_default() {
             Err(err) => LoadedConfig {
@@ -1131,8 +1139,10 @@ impl Config {
                 let _ = cfg.key_bindings();
 
                 std::env::set_var("WEZTERM_CONFIG_FILE", p);
+                std::env::set_var("ELWOOD_CONFIG_FILE", p);
                 if let Some(dir) = p.parent() {
                     std::env::set_var("WEZTERM_CONFIG_DIR", dir);
+                    std::env::set_var("ELWOOD_CONFIG_DIR", dir);
                 }
                 Ok(cfg)
             });
@@ -1376,6 +1386,12 @@ impl Config {
             font: italic,
             ..Default::default()
         });
+
+        // When built with the Elwood feature, default to Tokyo Night theme
+        #[cfg(feature = "elwood")]
+        if cfg.color_scheme.is_none() {
+            cfg.color_scheme = Some("Tokyo Night".to_string());
+        }
 
         // Load any additional color schemes into the color_schemes map
         cfg.load_color_schemes(&cfg.compute_color_scheme_dirs())
@@ -1739,26 +1755,26 @@ fn default_font_size() -> f64 {
 
 pub(crate) fn compute_cache_dir() -> anyhow::Result<PathBuf> {
     if let Some(runtime) = dirs_next::cache_dir() {
-        return Ok(runtime.join("wezterm"));
+        return Ok(runtime.join("elwood"));
     }
 
-    Ok(crate::HOME_DIR.join(".local/share/wezterm"))
+    Ok(crate::HOME_DIR.join(".local/share/elwood"))
 }
 
 pub(crate) fn compute_data_dir() -> anyhow::Result<PathBuf> {
     if let Some(runtime) = dirs_next::data_dir() {
-        return Ok(runtime.join("wezterm"));
+        return Ok(runtime.join("elwood"));
     }
 
-    Ok(crate::HOME_DIR.join(".local/share/wezterm"))
+    Ok(crate::HOME_DIR.join(".local/share/elwood"))
 }
 
 pub(crate) fn compute_runtime_dir() -> anyhow::Result<PathBuf> {
     if let Some(runtime) = dirs_next::runtime_dir() {
-        return Ok(runtime.join("wezterm"));
+        return Ok(runtime.join("elwood"));
     }
 
-    Ok(crate::HOME_DIR.join(".local/share/wezterm"))
+    Ok(crate::HOME_DIR.join(".local/share/elwood"))
 }
 
 pub fn pki_dir() -> anyhow::Result<PathBuf> {

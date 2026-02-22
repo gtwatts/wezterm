@@ -16,6 +16,7 @@
 //! @Cargo.toml @README.md compare these  -> attaches both files
 //! ```
 
+use crate::semantic_bridge::SemanticBridge;
 use std::path::{Path, PathBuf};
 
 /// Maximum file size to attach (100 KB).
@@ -192,6 +193,83 @@ pub fn resolve_and_build_prompt(
             read_attachment(&direct_path, cwd)
         } else {
             // Fall back to search
+            search_files(reference, cwd)
+                .first()
+                .and_then(|p| read_attachment(p, cwd))
+        };
+
+        if let Some(att) = attachment {
+            context_block.push_str(&format!(
+                "<file path=\"{}\">\n{}\n</file>\n\n",
+                att.label.trim_start_matches('@'),
+                att.content,
+            ));
+            attachments.push(att);
+        }
+    }
+
+    let augmented = if context_block.is_empty() {
+        user_text
+    } else if user_text.is_empty() {
+        context_block.trim_end().to_string()
+    } else {
+        format!("{context_block}{user_text}")
+    };
+
+    (attachments, augmented)
+}
+
+/// Resolve `@` references including `@symbol:name` patterns.
+///
+/// Extends [`resolve_and_build_prompt`] with symbol resolution:
+/// - `@symbol:functionName` resolves to the function's definition source
+/// - `@path/to/file` works as before (file attachment)
+///
+/// When `semantic_bridge` is `None`, `@symbol:` references are ignored.
+pub fn resolve_and_build_prompt_with_symbols(
+    input: &str,
+    cwd: &Path,
+    semantic_bridge: Option<&SemanticBridge>,
+) -> (Vec<ContextAttachment>, String) {
+    let (refs, user_text) = parse_at_references(input);
+    if refs.is_empty() {
+        return (Vec::new(), input.to_string());
+    }
+
+    let mut attachments = Vec::new();
+    let mut context_block = String::new();
+
+    for reference in &refs {
+        // Check for @symbol:name pattern
+        if let Some(symbol_name) = crate::semantic_bridge::extract_symbol_name(reference) {
+            if let Some(bridge) = semantic_bridge {
+                if let Some(def) = bridge.resolve_symbol(symbol_name) {
+                    let label = format!("@symbol:{}", def.name);
+                    context_block.push_str(&format!(
+                        "<symbol name=\"{}\" kind=\"{}\" file=\"{}\" line=\"{}\">\n{}\n</symbol>\n\n",
+                        def.name,
+                        def.kind,
+                        def.file.display(),
+                        def.start_line,
+                        def.source,
+                    ));
+                    attachments.push(ContextAttachment {
+                        label,
+                        path: def.file,
+                        content: def.source,
+                    });
+                    continue;
+                }
+            }
+            // Symbol not found — skip silently
+            continue;
+        }
+
+        // Standard file resolution
+        let direct_path = cwd.join(reference);
+        let attachment = if direct_path.is_file() {
+            read_attachment(&direct_path, cwd)
+        } else {
             search_files(reference, cwd)
                 .first()
                 .and_then(|p| read_attachment(p, cwd))

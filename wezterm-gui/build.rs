@@ -118,13 +118,13 @@ BEGIN
     BEGIN
         BLOCK "040904E4"
         BEGIN
-            VALUE "CompanyName",      "Wez Furlong\0"
-            VALUE "FileDescription",  "WezTerm - Wez's Terminal Emulator\0"
+            VALUE "CompanyName",      "Elwood Project\0"
+            VALUE "FileDescription",  "Elwood Terminal - AI-native terminal emulator\0"
             VALUE "FileVersion",      "{version}\0"
-            VALUE "LegalCopyright",   "Wez Furlong, MIT licensed\0"
+            VALUE "LegalCopyright",   "MIT License\0"
             VALUE "InternalName",     "\0"
             VALUE "OriginalFilename", "\0"
-            VALUE "ProductName",      "WezTerm\0"
+            VALUE "ProductName",      "Elwood Terminal\0"
             VALUE "ProductVersion",   "{version}\0"
         END
     END

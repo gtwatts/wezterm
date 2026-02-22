@@ -383,9 +383,10 @@ pub fn create_user_owned_dirs(p: &Path) -> anyhow::Result<()> {
 }
 
 fn xdg_config_home() -> PathBuf {
-    match std::env::var_os("XDG_CONFIG_HOME").map(|s| PathBuf::from(s).join("wezterm")) {
+    // Prefer elwood config dir, fall back to wezterm for backward compat
+    match std::env::var_os("XDG_CONFIG_HOME").map(|s| PathBuf::from(s).join("elwood")) {
         Some(p) => p,
-        None => HOME_DIR.join(".config").join("wezterm"),
+        None => HOME_DIR.join(".config").join("elwood"),
     }
 }
 
@@ -393,8 +394,15 @@ fn config_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     dirs.push(xdg_config_home());
 
+    // Also check legacy wezterm config dirs for backward compatibility
+    match std::env::var_os("XDG_CONFIG_HOME").map(|s| PathBuf::from(s).join("wezterm")) {
+        Some(p) => dirs.push(p),
+        None => dirs.push(HOME_DIR.join(".config").join("wezterm")),
+    }
+
     #[cfg(unix)]
     if let Some(d) = std::env::var_os("XDG_CONFIG_DIRS") {
+        dirs.extend(std::env::split_paths(&d).map(|s| PathBuf::from(s).join("elwood")));
         dirs.extend(std::env::split_paths(&d).map(|s| PathBuf::from(s).join("wezterm")));
     }
 

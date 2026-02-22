@@ -1,11 +1,11 @@
 [Desktop Entry]
-Name=WezTerm
-Comment=Wez's Terminal Emulator
-Keywords=shell;prompt;command;commandline;cmd;
-Icon=org.wezfurlong.wezterm
-StartupWMClass=org.wezfurlong.wezterm
-TryExec=wezterm
-Exec=wezterm start --cwd .
+Name=Elwood Terminal
+Comment=AI-native terminal emulator
+Keywords=shell;prompt;command;commandline;cmd;ai;agent;
+Icon=io.elwoodterminal.elwood
+StartupWMClass=io.elwoodterminal.elwood
+TryExec=elwood
+Exec=elwood start --cwd .
 Type=Application
 Categories=System;TerminalEmulator;Utility;
 Terminal=false

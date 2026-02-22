@@ -38,6 +38,7 @@ use crate::commands::{self, CommandResult};
 use crate::completions::CompletionEngine;
 use crate::context;
 use crate::diff;
+use crate::semantic_bridge::SemanticBridge;
 use crate::diff_viewer::{DiffViewer, ReviewAction};
 use crate::editor::InputEditor;
 use crate::git_info;
@@ -170,6 +171,8 @@ pub struct ElwoodPane {
     palette: Mutex<CommandPalette>,
     /// Fuzzy history search overlay (Ctrl+R).
     history_search: Mutex<HistorySearch>,
+    /// Semantic bridge for code-aware completions and context.
+    semantic_bridge: Mutex<Option<SemanticBridge>>,
 }
 
 /// A pending permission request waiting for user approval.
@@ -227,13 +230,18 @@ impl ElwoodPane {
             last_detection: Mutex::new(None),
             detector: ContentDetector::new(),
             suggester: NextCommandSuggester::new(),
-            session_log: Mutex::new(SessionLog::new(cwd)),
+            session_log: Mutex::new(SessionLog::new(cwd.clone())),
             inner_pty: Mutex::new(None),
             diff_viewer: Mutex::new(None),
             nl_classifier: NlClassifier::new(),
             completion_engine: Mutex::new(CompletionEngine::new()),
             palette: Mutex::new(CommandPalette::new()),
             history_search: Mutex::new(HistorySearch::new()),
+            semantic_bridge: {
+                let mut bridge = SemanticBridge::new(cwd);
+                bridge.initialize();
+                Mutex::new(Some(bridge))
+            },
         };
 
         // Render the full-screen TUI layout (includes welcome message)
@@ -507,6 +515,10 @@ impl ElwoodPane {
                                 let mut ss = self.screen.lock();
                                 ss.git_info = git_info::get_git_info(&cwd);
                             }
+                            // Refresh semantic index after commands (may have changed files)
+                            if let Some(ref mut bridge) = *self.semantic_bridge.lock() {
+                                bridge.refresh();
+                            }
                         }
                         AgentResponse::Error(msg) => {
                             self.session_log.lock().log_system(&format!("Error: {msg}"));
@@ -708,9 +720,12 @@ impl ElwoodPane {
             return;
         }
 
-        // ── @ context attachment ─────────────────────────────────────
+        // ── @ context attachment (with @symbol: support) ─────────────
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let (attachments, augmented_content) = context::resolve_and_build_prompt(&content, &cwd);
+        let bridge_guard = self.semantic_bridge.lock();
+        let (attachments, augmented_content) =
+            context::resolve_and_build_prompt_with_symbols(&content, &cwd, bridge_guard.as_ref());
+        drop(bridge_guard);
 
         // Log to session
         self.session_log.lock().log_user(&content);
@@ -846,7 +861,18 @@ impl ElwoodPane {
     fn update_ghost_text(&self) {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let input = self.input_editor.lock().content();
-        let ghost = self.completion_engine.lock().ghost_text(&input, &cwd);
+
+        // Try completions with symbol index for richer suggestions
+        let bridge_guard = self.semantic_bridge.lock();
+        let completions = self
+            .completion_engine
+            .lock()
+            .get_completions_with_symbols(&input, &cwd, bridge_guard.as_ref());
+        drop(bridge_guard);
+
+        let ghost = completions.first().and_then(|c| {
+            c.text.strip_prefix(&*input).map(|suffix| suffix.to_string())
+        }).filter(|s| !s.is_empty());
         self.input_editor.lock().set_ghost_text(ghost);
     }
 

@@ -7,6 +7,7 @@
 //!
 //! The top suggestion is rendered as dim "ghost text" after the cursor.
 
+use crate::semantic_bridge::SemanticBridge;
 use std::path::Path;
 use std::time::Instant;
 
@@ -30,6 +31,8 @@ pub enum CompletionSource {
     Filesystem,
     /// From static/built-in completions.
     Static,
+    /// From project symbol index (functions, structs, etc.).
+    Symbol,
 }
 
 /// A history entry with metadata for frecency scoring.
@@ -82,6 +85,20 @@ impl CompletionEngine {
     /// Returns completions ranked by source priority and score.
     /// The `cwd` parameter is used for filesystem completions.
     pub fn get_completions(&self, input: &str, cwd: &Path) -> Vec<Completion> {
+        self.get_completions_with_symbols(input, cwd, None)
+    }
+
+    /// Get completions including symbol completions from a [`SemanticBridge`].
+    ///
+    /// When `semantic_bridge` is `Some`, the last whitespace-delimited token
+    /// of `input` is used to fuzzy-match project symbols (functions, structs,
+    /// etc.) from the symbol index.
+    pub fn get_completions_with_symbols(
+        &self,
+        input: &str,
+        cwd: &Path,
+        semantic_bridge: Option<&SemanticBridge>,
+    ) -> Vec<Completion> {
         if input.is_empty() {
             return Vec::new();
         }
@@ -97,7 +114,12 @@ impl CompletionEngine {
             results.extend(filesystem_completions(last_token, input, cwd));
         }
 
-        // 3. Static completions
+        // 3. Symbol completions (from tree-sitter index)
+        if let Some(bridge) = semantic_bridge {
+            results.extend(symbol_completions(last_token, input, bridge));
+        }
+
+        // 4. Static completions
         results.extend(static_completions(input));
 
         // Sort by score descending
@@ -258,6 +280,32 @@ fn filesystem_completions(partial_path: &str, full_input: &str, cwd: &Path) -> V
 
     completions.truncate(10);
     completions
+}
+
+/// Generate symbol completions from the project's tree-sitter index.
+fn symbol_completions(
+    last_token: &str,
+    full_input: &str,
+    bridge: &SemanticBridge,
+) -> Vec<Completion> {
+    if last_token.len() < 2 {
+        return Vec::new();
+    }
+
+    let prefix_before_token = full_input.strip_suffix(last_token).unwrap_or("");
+
+    bridge
+        .complete_symbol(last_token, 10)
+        .into_iter()
+        .map(|sym| {
+            let full_text = format!("{prefix_before_token}{}", sym.name);
+            Completion {
+                text: full_text,
+                source: CompletionSource::Symbol,
+                score: sym.score * 0.8, // Slightly below history boost
+            }
+        })
+        .collect()
 }
 
 /// Generate static completions for common commands.

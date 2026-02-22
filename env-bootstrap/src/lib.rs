@@ -6,8 +6,10 @@ pub fn set_wezterm_executable() {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             std::env::set_var("WEZTERM_EXECUTABLE_DIR", dir);
+            std::env::set_var("ELWOOD_EXECUTABLE_DIR", dir);
         }
-        std::env::set_var("WEZTERM_EXECUTABLE", exe);
+        std::env::set_var("WEZTERM_EXECUTABLE", &exe);
+        std::env::set_var("ELWOOD_EXECUTABLE", &exe);
     }
 }
 
@@ -46,7 +48,7 @@ pub fn fixup_appimage() {
         // AppImage exports ARGV0 into the environment and that causes
         // everything that was indirectly spawned by us to appear to
         // be the AppImage.  eg: if you `vim foo` it shows as
-        // `WezTerm.AppImage foo`, which is super confusing for everyone!
+        // `Elwood.AppImage foo`, which is super confusing for everyone!
         // Let's just unset that from the environment!
         std::env::remove_var("ARGV0");
 
@@ -88,6 +90,8 @@ pub fn fixup_appimage() {
         fn clean_wezterm_config_env() {
             std::env::remove_var("WEZTERM_CONFIG_FILE");
             std::env::remove_var("WEZTERM_CONFIG_DIR");
+            std::env::remove_var("ELWOOD_CONFIG_FILE");
+            std::env::remove_var("ELWOOD_CONFIG_DIR");
         }
 
         if config::HOME_DIR.starts_with(append_extra_file_name_suffix(&appimage, ".home")) {

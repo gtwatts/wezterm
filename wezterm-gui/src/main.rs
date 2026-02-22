@@ -71,7 +71,7 @@ pub use termwindow::{set_window_class, set_window_position, TermWindow, ICON_DAT
     version = config::wezterm_version()
 )]
 struct Opt {
-    /// Skip loading wezterm.lua
+    /// Skip loading config.lua
     #[arg(long, short = 'n')]
     skip_config: bool,
 

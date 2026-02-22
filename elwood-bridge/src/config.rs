@@ -37,6 +37,10 @@ pub struct ElwoodConfig {
     /// Working directory for the agent session.
     /// Defaults to the current working directory.
     pub working_dir: Option<String>,
+
+    /// MCP (Model Context Protocol) configuration.
+    #[serde(default)]
+    pub mcp: crate::mcp::McpConfig,
 }
 
 impl Default for ElwoodConfig {
@@ -49,6 +53,7 @@ impl Default for ElwoodConfig {
             permission_mode: default_permission_mode(),
             scrollback_size: default_scrollback(),
             working_dir: None,
+            mcp: crate::mcp::McpConfig::default(),
         }
     }
 }

@@ -6,6 +6,7 @@
 
 use crate::pane::ElwoodPane;
 use crate::runtime::{AgentRequest, AgentResponse, RuntimeBridge};
+use crate::semantic_bridge::SemanticBridge;
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -188,7 +189,32 @@ async fn agent_runtime_loop(
     };
 
     // Create tool registry with default permissions
-    let tools = Arc::new(ToolRegistry::new(PermissionConfig::default()));
+    let mut tools_inner = ToolRegistry::new(PermissionConfig::default());
+
+    // Initialize MCP client manager and register discovered tools
+    let mut mcp_manager = crate::mcp::McpClientManager::new();
+    mcp_manager.connect_all(&config.mcp).await;
+
+    if mcp_manager.server_count() > 0 {
+        tracing::info!(
+            "MCP: {} servers connected, {} tools discovered",
+            mcp_manager.server_count(),
+            mcp_manager.discovered_tools().len(),
+        );
+
+        for (server_name, tool_def) in mcp_manager.discovered_tools() {
+            if let Some(client) = mcp_manager.get_client(server_name) {
+                let adapter = crate::mcp::McpToolAdapter::new(
+                    server_name,
+                    tool_def,
+                    Arc::clone(client),
+                );
+                tools_inner.register(Arc::new(adapter));
+            }
+        }
+    }
+
+    let tools = Arc::new(tools_inner);
 
     // Conversation history persists across turns within a session
     let mut messages: Vec<Message> = Vec::new();
@@ -196,10 +222,24 @@ async fn agent_runtime_loop(
     // Cancellation token — recreated for each agent turn
     let mut cancel = CancellationToken::new();
 
+    // Initialize semantic bridge for code-aware context enrichment
+    let semantic_bridge = {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let mut bridge = SemanticBridge::new(cwd);
+        // Initialize in a blocking spawn to avoid blocking the event loop
+        tokio::task::spawn_blocking(move || {
+            bridge.initialize();
+            bridge
+        })
+        .await
+        .ok()
+    };
+
     tracing::info!(
-        "Elwood agent runtime started (provider={}, model={})",
+        "Elwood agent runtime started (provider={}, model={}, symbols={})",
         config.provider,
-        config.model
+        config.model,
+        semantic_bridge.as_ref().map(|b| b.symbol_count()).unwrap_or(0),
     );
 
     while let Ok(req) = request_rx.recv_async().await {
@@ -243,14 +283,33 @@ async fn agent_runtime_loop(
                     let cwd = std::env::current_dir()
                         .unwrap_or_else(|_| std::path::PathBuf::from("."));
                     let git_ctx = crate::git_info::get_git_context(&cwd);
-                    if git_ctx.branch.is_empty() {
-                        content.clone()
-                    } else {
-                        format!(
-                            "[Git Context]\n{}\n[User Message]\n{content}",
+
+                    let mut parts = Vec::new();
+
+                    if !git_ctx.branch.is_empty() {
+                        parts.push(format!(
+                            "[Git Context]\n{}",
                             git_ctx.format_context()
-                        )
+                        ));
                     }
+
+                    // Enrich with relevant code context from semantic bridge
+                    if let Some(ref bridge) = semantic_bridge {
+                        let snippets = bridge.find_relevant_context(&content, 2048);
+                        if !snippets.is_empty() {
+                            let mut ctx = String::from("[Relevant Code]\n");
+                            for snippet in &snippets {
+                                ctx.push_str(&format!(
+                                    "<code ref=\"{}\" relevance=\"{:.2}\">\n{}\n</code>\n",
+                                    snippet.id, snippet.score, snippet.text,
+                                ));
+                            }
+                            parts.push(ctx);
+                        }
+                    }
+
+                    parts.push(format!("[User Message]\n{content}"));
+                    parts.join("\n")
                 };
 
                 // Append user message to ongoing conversation
@@ -335,6 +394,8 @@ async fn agent_runtime_loop(
             AgentRequest::Shutdown => {
                 tracing::info!("Elwood agent runtime shutting down");
                 cancel.cancel();
+                // Shut down all MCP server connections
+                mcp_manager.shutdown_all().await;
                 let _ = response_tx.send(AgentResponse::Shutdown);
                 break;
             }

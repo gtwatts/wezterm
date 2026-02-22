@@ -31,18 +31,21 @@ pub mod git_info;
 pub mod history_search;
 pub mod keybindings;
 pub mod lua_api;
+pub mod mcp;
 pub mod nl_classifier;
 pub mod observer;
 pub mod palette;
 pub mod pane;
 pub mod pty_inner;
 pub mod runtime;
+pub mod semantic_bridge;
 pub mod session_log;
 pub mod shared_writer;
 pub mod tools;
 
 mod formatter;
 pub mod screen;
+pub mod theme;
 
 pub use domain::ElwoodDomain;
 pub use git_info::{GitContext, GitInfo};

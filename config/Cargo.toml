@@ -12,6 +12,7 @@ env_logger.workspace = true
 
 [features]
 distro-defaults = []
+elwood = []
 
 [dependencies]
 anyhow.workspace = true

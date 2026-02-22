@@ -26,6 +26,7 @@
 
 use crate::git_info::GitInfo;
 use crate::runtime::InputMode;
+use crate::theme;
 use std::time::Instant;
 
 // ─── TokyoNight Color Palette ────────────────────────────────────────────
@@ -85,6 +86,7 @@ const BOX_BL: char = '╰';
 const BOX_BR: char = '╯';
 const BOX_H: char = '─';
 const BOX_V: char = '│';
+#[allow(dead_code)]
 const DOUBLE_H: char = '═';
 const CHECK: &str = "✔";
 const GEAR: &str = "⚙";
@@ -260,48 +262,82 @@ pub fn render_full_screen(state: &ScreenState) -> String {
 }
 
 /// Render the welcome message at absolute positions in the chat area.
+///
+/// Shows a visually appealing welcome screen with a decorative box header,
+/// quick start hints, and keyboard shortcuts.
 fn render_welcome_at(state: &ScreenState) -> String {
     let accent = fgc(ACCENT);
     let success = fgc(SUCCESS);
     let fg_main = fgc(FG);
     let info = fgc(INFO);
     let white = fgc(WHITE);
+    let muted = fgc(MUTED);
+    let border = fgc(BORDER);
     let top = state.chat_top();
 
     let mut out = String::new();
+    let r = RESET;
     // Row top: blank line
     out.push_str(&goto(top, 1));
     out.push_str(CLEAR_EOL);
-    // Row top+1: title
+
+    // ── Decorative header box ──────────────────────────────────────
+    let box_w = 43;
+    let hline: String = std::iter::repeat(BOX_H).take(box_w).collect();
+
+    // Row top+1: top border
     out.push_str(&goto(top + 1, 1));
+    out.push_str(&format!("    {accent}{BOX_TL}{hline}{BOX_TR}{r}"));
+    out.push_str(CLEAR_EOL);
+
+    // Row top+2: title line
+    out.push_str(&goto(top + 2, 1));
     out.push_str(&format!(
-        "  {accent}{BOLD}Elwood Agent{RESET} {white}{ARROW} terminal-native AI coding assistant{RESET}",
+        "    {accent}{BOX_V}{r}       {accent}{BOLD}Elwood Terminal{r} {white}v0.1.0{r}            {accent}{BOX_V}{r}",
     ));
     out.push_str(CLEAR_EOL);
-    // Row top+2: blank
-    out.push_str(&goto(top + 2, 1));
-    out.push_str(CLEAR_EOL);
-    // Row top+3: instruction
+
+    // Row top+3: subtitle
     out.push_str(&goto(top + 3, 1));
     out.push_str(&format!(
-        "  {fg_main}Type a message below to get started.{RESET}",
+        "    {accent}{BOX_V}{r}   {muted}AI-native {border}\u{00B7}{r} {muted}Open Source {border}\u{00B7}{r} {muted}Local{r}         {accent}{BOX_V}{r}",
     ));
     out.push_str(CLEAR_EOL);
-    // Row top+4: blank
+
+    // Row top+4: bottom border
     out.push_str(&goto(top + 4, 1));
+    out.push_str(&format!("    {accent}{BOX_BL}{hline}{BOX_BR}{r}"));
     out.push_str(CLEAR_EOL);
-    // Row top+5: tip line 1
+
+    // Row top+5: blank
     out.push_str(&goto(top + 5, 1));
-    out.push_str(&format!(
-        "  {success}{BOLD}Tip:{RESET} {info}Press Ctrl+T to toggle Terminal mode, or prefix with ! to run commands.{RESET}",
-    ));
     out.push_str(CLEAR_EOL);
-    // Row top+6: tip line 2
+
+    // ── Quick start section ────────────────────────────────────────
     out.push_str(&goto(top + 6, 1));
-    out.push_str(&format!(
-        "       {info}The agent can read panes, edit files, and navigate your codebase.{RESET}",
-    ));
+    out.push_str(&format!("    {success}{BOLD}Quick Start:{r}"));
     out.push_str(CLEAR_EOL);
+
+    let hints: &[(&str, &str)] = &[
+        ("Type a message", "to chat with AI"),
+        ("Press Ctrl+T", "to switch to terminal mode"),
+        ("Use ! prefix", "for quick commands"),
+        ("Type @file.rs", "to attach context"),
+        ("Press Ctrl+P", "for command palette"),
+    ];
+
+    for (i, (key, desc)) in hints.iter().enumerate() {
+        let row = top + 7 + i as u16;
+        if row >= state.chat_bottom() {
+            break;
+        }
+        out.push_str(&goto(row, 1));
+        out.push_str(&format!(
+            "    {muted}{ARROW}{r} {info}{key}{r} {fg_main}{desc}{r}",
+        ));
+        out.push_str(CLEAR_EOL);
+    }
+
     out
 }
 
@@ -517,7 +553,8 @@ pub fn render_input_box(state: &ScreenState) -> String {
 
 /// Render the status bar (last row).
 ///
-/// Layout: ` [/help] cmds  [^C] quit    Status · model · 5.2K tok · 12s `
+/// Warp-style badges/chips layout:
+/// ` [Agent] | main* | gemini-2.5-pro | 5.2K tok | $0.03 | 12s    ^T mode · ^P palette `
 pub fn render_status_bar(state: &ScreenState) -> String {
     let w = state.width as usize;
     let row = state.status_row();
@@ -528,12 +565,9 @@ pub fn render_status_bar(state: &ScreenState) -> String {
     out.push_str(&sbg);
     out.push_str(CLEAR_EOL);
 
-    // Left: key hints
-    let key_bg = bgc(SELECTION);
-    let key_fg = fgc(FG);
-    let label_fg = fgc(MUTED);
+    // ── Left section: mode badge + git + status ─────────────────────
 
-    // Mode pill badge
+    // Mode pill badge with colored background
     let (mode_label, mode_color) = match state.input_mode {
         InputMode::Agent => (" Agent ", ACCENT),
         InputMode::Terminal => (" Term ", WARNING),
@@ -541,75 +575,81 @@ pub fn render_status_bar(state: &ScreenState) -> String {
     let mode_bg = bgc(mode_color);
     let mode_fg = fg(BG.0, BG.1, BG.2);
 
-    // Git branch pill
-    let git_str = if let Some(ref gi) = state.git_info {
-        let git_fg = fgc(MUTED);
-        let branch_fg = fgc(INFO);
-        let dirty_fg = fgc(WARNING);
+    // Git branch chip
+    let git_chip = if let Some(ref gi) = state.git_info {
+        let branch_fg = fgc(SUCCESS);
         let dirty_mark = if gi.is_dirty {
-            format!("{dirty_fg}*{RESET}{sbg}")
+            format!("{}*{RESET}{sbg}", fgc(WARNING))
         } else {
             String::new()
         };
         let mut ab = String::new();
         if gi.ahead > 0 {
-            ab.push_str(&format!(" {}{}\u{2191}{}{RESET}{sbg}", fgc(SUCCESS), "", gi.ahead));
+            ab.push_str(&format!(" {}\u{2191}{}{RESET}{sbg}", fgc(SUCCESS), gi.ahead));
         }
         if gi.behind > 0 {
-            ab.push_str(&format!(" {}{}\u{2193}{}{RESET}{sbg}", fgc(ERROR), "", gi.behind));
+            ab.push_str(&format!(" {}\u{2193}{}{RESET}{sbg}", fgc(ERROR), gi.behind));
         }
         format!(
-            "  {git_fg}\u{E0A0}{RESET}{sbg} {branch_fg}{}{RESET}{sbg}{dirty_mark}{ab}",
+            " {sep} {branch_fg}\u{E0A0} {}{RESET}{sbg}{dirty_mark}{ab}",
             gi.branch,
+            sep = format!("{}·{RESET}{sbg}", fgc(MUTED)),
         )
     } else {
         String::new()
     };
 
-    out.push_str(&goto(row, 1));
-    out.push_str(&format!(
-        "{sbg} {mode_bg}{mode_fg}{BOLD}{mode_label}{RESET}{sbg}{git_str}  \
-         {key_bg}{key_fg}{BOLD} /help {RESET}{sbg} {label_fg}cmds{RESET}{sbg}  \
-         {key_bg}{key_fg}{BOLD} ^C {RESET}{sbg} {label_fg}quit{RESET}{sbg}  \
-         {key_bg}{key_fg}{BOLD} ^T {RESET}{sbg} {label_fg}mode{RESET}{sbg}",
-    ));
+    // Model chip
+    let model_chip = if !state.model_name.is_empty() {
+        let sep = format!("{}·{RESET}{sbg}", fgc(MUTED));
+        format!(" {sep} {}{}{RESET}{sbg}", fgc(ACCENT), state.model_name)
+    } else {
+        String::new()
+    };
 
-    // Right: status · model · tokens · elapsed
-    let mut right_parts: Vec<String> = Vec::new();
-
-    // Status
-    if state.is_running {
+    // Status indicator with spinner
+    let status_chip = if state.is_running {
+        let spinner = theme::spinner_frame(
+            state.tool_start
+                .map(|s| s.elapsed().as_millis() as usize / 80)
+                .unwrap_or(0),
+        );
         if let Some(ref tool) = state.active_tool {
             let elapsed = state.tool_start
-                .map(|s| format!(" ({:.1}s)", s.elapsed().as_secs_f64()))
+                .map(|s| format!(" {:.1}s", s.elapsed().as_secs_f64()))
                 .unwrap_or_default();
-            right_parts.push(format!(
-                "{}Running {tool}...{elapsed}{RESET}",
-                fgc(INFO),
-            ));
+            format!(
+                " {sep} {info}{spinner} {tool}{elapsed}{RESET}{sbg}",
+                sep = format!("{}·{RESET}{sbg}", fgc(MUTED)),
+                info = fgc(INFO),
+            )
         } else {
-            right_parts.push(format!("{}Thinking{RESET}", fgc(INFO)));
+            format!(
+                " {sep} {info}{spinner} Thinking{RESET}{sbg}",
+                sep = format!("{}·{RESET}{sbg}", fgc(MUTED)),
+                info = fgc(INFO),
+            )
         }
     } else if state.awaiting_permission {
-        right_parts.push(format!(
-            "{}{BOLD}Permission needed{RESET}",
-            fgc(WARNING),
-        ));
+        format!(
+            " {sep} {warn}{BOLD}\u{26A0} Permission{RESET}{sbg}",
+            sep = format!("{}·{RESET}{sbg}", fgc(MUTED)),
+            warn = fgc(WARNING),
+        )
     } else {
-        right_parts.push(format!("{}Ready{RESET}", fgc(MUTED)));
-    }
+        String::new()
+    };
 
-    // Model
-    if !state.model_name.is_empty() {
-        right_parts.push(format!("{}{}{RESET}", fgc(MUTED), state.model_name));
-    }
+    // Assemble left section
+    out.push_str(&goto(row, 1));
+    out.push_str(&format!(
+        "{sbg} {mode_bg}{mode_fg}{BOLD}{mode_label}{RESET}{sbg}{git_chip}{model_chip}{status_chip}",
+    ));
 
-    // Cost
-    if state.cost > 0.0 {
-        right_parts.push(format!("{}${:.4}{RESET}", fgc(MUTED), state.cost));
-    }
+    // ── Right section: tokens, cost, elapsed, keyboard hints ────────
+    let mut right_parts: Vec<String> = Vec::new();
 
-    // Tokens
+    // Token count
     if state.tokens_used > 0 {
         right_parts.push(format!("{}{}{RESET}", fgc(MUTED), format_tokens(state.tokens_used)));
     }
@@ -626,6 +666,11 @@ pub fn render_status_bar(state: &ScreenState) -> String {
         ));
     }
 
+    // Cost
+    if state.cost > 0.0 {
+        right_parts.push(format!("{}${:.4}{RESET}", fgc(MUTED), state.cost));
+    }
+
     // Elapsed
     let elapsed_secs = if let Some(start) = state.task_start {
         Some(start.elapsed().as_secs())
@@ -636,12 +681,20 @@ pub fn render_status_bar(state: &ScreenState) -> String {
         right_parts.push(format!("{}{}{RESET}", fgc(MUTED), format_elapsed(secs)));
     }
 
-    // Join with " · " separators
-    let sep = format!(" {}·{RESET} ", fgc(MUTED));
+    // Keyboard hints (rightmost)
+    let hints = format!(
+        "{key_bg}{key_fg} ^T {RESET}{sbg}{label} {key_bg}{key_fg} ^P {RESET}{sbg}{label2} {key_bg}{key_fg} F1 {RESET}{sbg}",
+        key_bg = bgc(SELECTION),
+        key_fg = fgc(FG),
+        label = format!("{}mode{RESET}{sbg}", fgc(MUTED)),
+        label2 = format!("{}palette{RESET}{sbg}", fgc(MUTED)),
+    );
+    right_parts.push(hints);
+
+    // Join right parts with " · "
+    let sep = format!(" {}·{RESET}{sbg} ", fgc(MUTED));
     let right_str = right_parts.join(&sep);
 
-    // Position right-aligned (approximate — just put it toward the right)
-    // Count visible chars roughly: strip ANSI codes
     let visible_len = strip_ansi_len(&right_str);
     let right_col = w.saturating_sub(visible_len + 2);
     out.push_str(&goto(row, right_col as u16));
@@ -661,16 +714,32 @@ pub fn render_chat_content(text: &str) -> String {
 }
 
 /// Write a styled user prompt line into the chat area.
+///
+/// User messages get a green accent border:
+/// ```text
+///   You  Fix the failing test in src/auth.rs
+/// ```
 pub fn format_user_prompt(text: &str) -> String {
+    let user_accent = fgc(SUCCESS);
     format!(
-        "\r\n{}{BOLD}You{RESET}  {}{text}{RESET}\r\n\r\n",
-        fgc(ACCENT), fgc(FG),
+        "\r\n  {user_accent}{BOLD}You{RESET}  {}{text}{RESET}\r\n\r\n",
+        fgc(FG),
     )
 }
 
 /// Write the "Elwood" prefix before streaming starts.
+///
+/// Agent messages get a blue accent with block chrome:
+/// ```text
+/// ╭─ Elwood ────────────────────────────────────────╮
+/// │  Response text...
+/// ```
 pub fn format_assistant_prefix() -> String {
-    format!("{}{BOLD}Elwood:{RESET}  ", fgc(SUCCESS))
+    let agent_accent = fgc(ACCENT);
+    let fill: String = std::iter::repeat(BOX_H).take(42).collect();
+    format!(
+        "{agent_accent}{BOX_TL}{BOX_H}{RESET} {agent_accent}{BOLD}Elwood{RESET} {agent_accent}{fill}{BOX_TR}{RESET}\r\n{agent_accent}{BOX_V}{RESET}  ",
+    )
 }
 
 /// Format a content delta (streaming text).
@@ -679,92 +748,124 @@ pub fn format_content(text: &str) -> String {
 }
 
 /// Format a tool start event.
+///
+/// Renders as a tool execution block with purple accent border:
+/// ```text
+/// ╭─ ⚙ ReadFile ──────────────────────────────────╮
+/// │  src/main.rs                                    │
+/// ```
 pub fn format_tool_start(tool_name: &str, preview: &str) -> String {
-    let border = fgc(BORDER);
-    let warn = fgc(WARNING);
+    let tool_color = fgc((187, 154, 247)); // purple - tool accent
     let muted = fgc(MUTED);
 
     let title = format!(" {GEAR} {tool_name} ");
-    let fill_len = 50usize.saturating_sub(title.len() + 2);
+    let fill_len = 54usize.saturating_sub(title.len() + 2);
     let fill: String = std::iter::repeat(BOX_H).take(fill_len).collect();
 
     let mut out = String::new();
     out.push_str(&format!(
-        "\r\n{border}{BOX_TL}{BOX_H}{RESET}{warn}{BOLD}{title}{RESET}{border}{fill}{BOX_TR}{RESET}\r\n",
+        "\r\n{tool_color}{BOX_TL}{BOX_H}{RESET}{tool_color}{BOLD}{title}{RESET}{tool_color}{fill}{BOX_TR}{RESET}\r\n",
     ));
     if !preview.is_empty() {
-        let p = truncate(preview, 46);
-        out.push_str(&format!("{border}{BOX_V}{RESET}  {muted}{p}{RESET}\r\n"));
+        let p = truncate(preview, 50);
+        out.push_str(&format!("{tool_color}{BOX_V}{RESET}  {muted}{p}{RESET}\r\n"));
     }
     out
 }
 
 /// Format a tool end event.
+///
+/// Closes the tool block with exit status:
+/// ```text
+/// │  ✔ OK — 200 lines                              │
+/// ╰────────────────────────────────────────────────╯
+/// ```
 pub fn format_tool_end(success: bool, preview: &str) -> String {
-    let border = fgc(BORDER);
+    let tool_color = fgc((187, 154, 247)); // purple - tool accent
     let (icon, color) = if success {
         (CHECK, fgc(SUCCESS))
     } else {
         (CROSS, fgc(ERROR))
     };
     let status = if success { "OK" } else { "FAIL" };
-    let p = truncate(preview, 42);
+    let p = truncate(preview, 46);
 
     let mut out = String::new();
     out.push_str(&format!(
-        "{border}{BOX_V}{RESET}  {color}{BOLD}{icon} {status}{RESET}",
+        "{tool_color}{BOX_V}{RESET}  {color}{BOLD}{icon} {status}{RESET}",
     ));
     if !p.is_empty() {
         let muted = fgc(MUTED);
-        out.push_str(&format!(" {muted}{p}{RESET}"));
+        out.push_str(&format!(" {muted}{DIM}{BOX_H} {p}{RESET}"));
     }
     out.push_str("\r\n");
 
-    let fill: String = std::iter::repeat(BOX_H).take(50).collect();
-    out.push_str(&format!("{border}{BOX_BL}{fill}{BOX_BR}{RESET}\r\n"));
+    let fill: String = std::iter::repeat(BOX_H).take(54).collect();
+    out.push_str(&format!("{tool_color}{BOX_BL}{fill}{BOX_BR}{RESET}\r\n"));
     out
 }
 
 /// Format a turn completion banner.
+///
+/// Closes the agent block and shows a completion summary:
+/// ```text
+/// │
+/// │  ✔ Done ▸ Completed in 3 steps
+/// ╰──────────────────────────────────────────────────╯
+/// ```
 pub fn format_turn_complete(summary: Option<&str>) -> String {
+    let agent_accent = fgc(ACCENT);
     let success = fgc(SUCCESS);
     let muted = fgc(MUTED);
-    let sep: String = std::iter::repeat(DOUBLE_H).take(38).collect();
 
     let suffix = summary
         .map(|s| format!(" {muted}{ARROW} {}{RESET}", truncate(s, 55)))
         .unwrap_or_default();
 
+    let fill: String = std::iter::repeat(BOX_H).take(52).collect();
+
     format!(
-        "\r\n{muted}{sep}{RESET}\r\n{success}{BOLD}{CHECK} Done{RESET}{suffix}\r\n{muted}{sep}{RESET}\r\n",
+        "\r\n{agent_accent}{BOX_V}{RESET}\r\n\
+         {agent_accent}{BOX_V}{RESET}  {success}{BOLD}{CHECK} Done{RESET}{suffix}\r\n\
+         {agent_accent}{BOX_BL}{fill}{BOX_BR}{RESET}\r\n",
     )
 }
 
 /// Format a permission request box.
+///
+/// Permission prompts use amber accent for high visibility:
+/// ```text
+/// ╭─ Permission Required ────────────────────────────╮
+/// │  BashTool                                         │
+/// │  rm -rf /tmp/test                                 │
+/// │                                                   │
+/// │  [y] approve   [n] deny   [a] always              │
+/// ╰──────────────────────────────────────────────────╯
+/// ```
 pub fn format_permission_request(tool_name: &str, description: &str) -> String {
-    let border = fgc(ACCENT);
+    let perm_accent = fgc(WARNING);
     let warn = fgc(WARNING);
     let muted = fgc(MUTED);
     let fgv = fgc(FG);
-    let key_bg = bgc(ACCENT);
+    let key_bg = bgc(WARNING);
     let key_fg = fg(BG.0, BG.1, BG.2);
 
-    let title = " Permission Required ";
-    let fill_len = 50usize.saturating_sub(title.len() + 2);
+    let title = " \u{26A0} Permission Required ";
+    let fill_len = 54usize.saturating_sub(title.len() + 2);
     let fill: String = std::iter::repeat(BOX_H).take(fill_len).collect();
-    let bot: String = std::iter::repeat(BOX_H).take(50).collect();
-    let desc = truncate(description, 46);
+    let bot: String = std::iter::repeat(BOX_H).take(54).collect();
+    let desc = truncate(description, 50);
 
     format!(
         concat!(
-            "\r\n{b}{bold}{tl}{h} {w}{bold}{title}{r}{b}{bold}{fill}{tr}{r}\r\n",
+            "\r\n{b}{tl}{h} {w}{bold}{title}{r}{b}{fill}{tr}{r}\r\n",
             "{b}{v}{r}  {w}{bold}{tool}{r}\r\n",
             "{b}{v}{r}  {fg}{desc}{r}\r\n",
             "{b}{v}{r}\r\n",
             "{b}{v}{r}  {kb}{kf} y {r} {m}approve   {kb}{kf} n {r} {m}deny{r}\r\n",
-            "{b}{bold}{bl}{bot}{br}{r}\r\n",
+            "{b}{bl}{bot}{br}{r}\r\n",
         ),
-        b = border, bold = BOLD, r = RESET,
+        b = perm_accent, bold = BOLD, r = RESET,
         tl = BOX_TL, tr = BOX_TR, bl = BOX_BL, br = BOX_BR,
         h = BOX_H, v = BOX_V,
         w = warn, m = muted, fg = fgv,
@@ -775,37 +876,51 @@ pub fn format_permission_request(tool_name: &str, description: &str) -> String {
 }
 
 /// Format the welcome message shown in the chat area on first open.
+///
+/// This version uses `\n` line endings (not `\r\n`) since the cursor is
+/// already at column 1 inside the scroll region.
 pub fn format_welcome() -> String {
     let accent = fgc(ACCENT);
     let success = fgc(SUCCESS);
     let fg_main = fgc(FG);
     let info = fgc(INFO);
     let white = fgc(WHITE);
+    let muted = fgc(MUTED);
+    let border = fgc(BORDER);
 
-    // Use explicit \n (not \r\n) since cursor is already at column 1
-    // and the scroll region handles line breaks
+    let box_w = 43;
+    let hline: String = std::iter::repeat(BOX_H).take(box_w).collect();
+
     let mut out = String::new();
-    out.push_str(&format!(
-        "  {accent}{BOLD}Elwood Agent{RESET} {white}{ARROW} terminal-native AI coding assistant{RESET}\n",
-    ));
     out.push('\n');
+
+    // Decorative header box
+    out.push_str(&format!("    {accent}{BOX_TL}{hline}{BOX_TR}{RESET}\n"));
     out.push_str(&format!(
-        "  {fg_main}Type a message below to get started.{RESET}\n",
+        "    {accent}{BOX_V}{RESET}       {accent}{BOLD}Elwood Terminal{RESET} {white}v0.1.0{RESET}            {accent}{BOX_V}{RESET}\n",
     ));
+    out.push_str(&format!(
+        "    {accent}{BOX_V}{RESET}   {muted}AI-native {border}\u{00B7}{RESET} {muted}Open Source {border}\u{00B7}{RESET} {muted}Local{RESET}         {accent}{BOX_V}{RESET}\n",
+    ));
+    out.push_str(&format!("    {accent}{BOX_BL}{hline}{BOX_BR}{RESET}\n"));
     out.push('\n');
-    out.push_str(&format!(
-        "  {success}{BOLD}Tip:{RESET} {info}Press Ctrl+T to toggle Terminal mode, or prefix with ! to run commands.{RESET}\n",
-    ));
-    out.push_str(&format!(
-        "       {info}The agent can read panes, edit files, and navigate your codebase.{RESET}\n",
-    ));
+
+    // Quick start hints
+    out.push_str(&format!("    {success}{BOLD}Quick Start:{RESET}\n"));
+    let hints: &[(&str, &str)] = &[
+        ("Type a message", "to chat with AI"),
+        ("Press Ctrl+T", "to switch to terminal mode"),
+        ("Use ! prefix", "for quick commands"),
+        ("Type @file.rs", "to attach context"),
+        ("Press Ctrl+P", "for command palette"),
+    ];
+    for (key, desc) in hints {
+        out.push_str(&format!(
+            "    {muted}{ARROW}{RESET} {info}{key}{RESET} {fg_main}{desc}{RESET}\n",
+        ));
+    }
     out.push('\n');
     out
-}
-
-/// Format an error message.
-pub fn format_error(msg: &str) -> String {
-    format!("\r\n{}{BOLD}{CROSS} Error:{RESET} {}{msg}{RESET}\r\n", fgc(ERROR), fgc(FG))
 }
 
 /// Format a `$ command` prompt line in the chat area.
@@ -817,13 +932,22 @@ pub fn format_command_prompt(command: &str) -> String {
 }
 
 /// Format shell command output as a boxed section with exit code.
+///
+/// Uses a muted border for command output to distinguish from agent/tool blocks:
+/// ```text
+/// ╭─ $ git status ──────────────────────────────────╮
+/// │  On branch main                                   │
+/// │  nothing to commit                                │
+/// │  ✔ exit 0                                         │
+/// ╰──────────────────────────────────────────────────╯
+/// ```
 pub fn format_command_output(
     command: &str,
     stdout: &str,
     stderr: &str,
     exit_code: Option<i32>,
 ) -> String {
-    let border = fgc(BORDER);
+    let cmd_color = fgc(MUTED);
     let muted = fgc(MUTED);
     let fgv = fgc(FG);
     let r = RESET;
@@ -835,25 +959,28 @@ pub fn format_command_output(
         (CROSS, fgc(ERROR))
     };
 
-    let title = format!(" Shell: {command} ");
-    let title_display = truncate(&title, 46);
-    let fill_len = 50usize.saturating_sub(title_display.len() + 2);
+    let title = format!(" $ {command} ");
+    let title_display = truncate(&title, 48);
+    let fill_len = 54usize.saturating_sub(title_display.len() + 2);
     let fill: String = std::iter::repeat(BOX_H).take(fill_len).collect();
+    let bot: String = std::iter::repeat(BOX_H).take(54).collect();
 
     let mut out = String::new();
 
     // Top border
     out.push_str(&format!(
-        "\r\n{border}{BOX_TL}{BOX_H}{r}{muted}{BOLD}{title_display}{r}{border}{fill}{BOX_TR}{r}\r\n",
+        "\r\n{cmd_color}{BOX_TL}{BOX_H}{r}{muted}{BOLD}{title_display}{r}{cmd_color}{fill}{BOX_TR}{r}\r\n",
     ));
 
     // stdout lines
     if !stdout.is_empty() {
         for line in stdout.lines().take(50) {
-            out.push_str(&format!("{border}{BOX_V}{r}  {fgv}{line}{r}\r\n"));
+            out.push_str(&format!("{cmd_color}{BOX_V}{r}  {fgv}{line}{r}\r\n"));
         }
         if stdout.lines().count() > 50 {
-            out.push_str(&format!("{border}{BOX_V}{r}  {muted}... (truncated){r}\r\n"));
+            out.push_str(&format!(
+                "{cmd_color}{BOX_V}{r}  {muted}{ARROW} {DIM}42 more lines hidden{r}\r\n",
+            ));
         }
     }
 
@@ -861,18 +988,17 @@ pub fn format_command_output(
     if !stderr.is_empty() {
         let err_color = fgc(ERROR);
         for line in stderr.lines().take(20) {
-            out.push_str(&format!("{border}{BOX_V}{r}  {err_color}{line}{r}\r\n"));
+            out.push_str(&format!("{cmd_color}{BOX_V}{r}  {err_color}{line}{r}\r\n"));
         }
     }
 
     // Exit code footer
     out.push_str(&format!(
-        "{border}{BOX_V}{r}  {status_color}{BOLD}{icon} exit {code}{r}\r\n",
+        "{cmd_color}{BOX_V}{r}  {status_color}{BOLD}{icon} exit {code}{r}\r\n",
     ));
 
     // Bottom border
-    let bot: String = std::iter::repeat(BOX_H).take(50).collect();
-    out.push_str(&format!("{border}{BOX_BL}{bot}{BOX_BR}{r}\r\n"));
+    out.push_str(&format!("{cmd_color}{BOX_BL}{bot}{BOX_BR}{r}\r\n"));
 
     out
 }
@@ -907,6 +1033,147 @@ pub fn format_next_command_suggestion(suggestion: &str) -> String {
     format!(
         "{muted}  [>]{RESET} {success}Next:{RESET} {muted}{suggestion}{RESET}\r\n",
     )
+}
+
+/// Format an error message with a red accent block.
+///
+/// ```text
+/// ╭─ ✗ Error ─────────────────────────────────────────╮
+/// │  Error message text                                 │
+/// ╰────────────────────────────────────────────────────╯
+/// ```
+pub fn format_error(msg: &str) -> String {
+    let err_color = fgc(ERROR);
+    let fgv = fgc(FG);
+
+    let title = format!(" {CROSS} Error ");
+    let fill_len = 54usize.saturating_sub(title.len() + 2);
+    let fill: String = std::iter::repeat(BOX_H).take(fill_len).collect();
+    let bot: String = std::iter::repeat(BOX_H).take(54).collect();
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "\r\n{err_color}{BOX_TL}{BOX_H}{RESET}{err_color}{BOLD}{title}{RESET}{err_color}{fill}{BOX_TR}{RESET}\r\n",
+    ));
+    // Wrap long messages across lines
+    for line in msg.lines() {
+        let truncated = truncate(line, 50);
+        out.push_str(&format!("{err_color}{BOX_V}{RESET}  {fgv}{truncated}{RESET}\r\n"));
+    }
+    out.push_str(&format!("{err_color}{BOX_BL}{bot}{BOX_BR}{RESET}\r\n"));
+    out
+}
+
+/// Render a keyboard shortcut overlay (cheat sheet).
+///
+/// Shown when the user presses F1 or Ctrl+?. Renders as an absolute-positioned
+/// box in the center of the chat area.
+///
+/// ```text
+/// ╭─ Keyboard Shortcuts ──────────────────────────╮
+/// │                                                │
+/// │  Ctrl+T     Toggle Agent/Terminal mode         │
+/// │  Ctrl+P     Command palette                    │
+/// │  Ctrl+F     Quick-fix suggestion               │
+/// │  ...                                           │
+/// │                                                │
+/// │  Press F1 or Esc to close                      │
+/// ╰────────────────────────────────────────────────╯
+/// ```
+pub fn render_shortcut_overlay(state: &ScreenState) -> String {
+    let accent = fgc(ACCENT);
+    let fgv = fgc(FG);
+    let muted = fgc(MUTED);
+    let key_bg = bgc(SELECTION);
+    let key_fg = fgc(FG);
+    let r = RESET;
+
+    let box_w = 52usize;
+    let hline: String = std::iter::repeat(BOX_H).take(box_w).collect();
+
+    let title = " Keyboard Shortcuts ";
+    let title_fill_len = box_w.saturating_sub(title.len() + 1);
+    let title_fill: String = std::iter::repeat(BOX_H).take(title_fill_len).collect();
+
+    // Center the overlay vertically in the chat area
+    let chat_h = state.chat_bottom().saturating_sub(state.chat_top()) + 1;
+    let overlay_height = 16u16; // lines including borders
+    let start_row = state.chat_top() + chat_h.saturating_sub(overlay_height) / 2;
+
+    // Shortcuts to display
+    let shortcuts: &[(&str, &str)] = &[
+        ("Ctrl+T", "Toggle Agent / Terminal mode"),
+        ("Ctrl+P", "Command palette"),
+        ("Ctrl+F", "Quick-fix from AI suggestion"),
+        ("Ctrl+L", "Clear screen"),
+        ("Ctrl+C", "Cancel current operation"),
+        ("Ctrl+D", "Exit / close pane"),
+        ("Shift+Enter", "New line in input"),
+        ("Enter", "Send message / run command"),
+        ("Tab", "Accept ghost text completion"),
+        ("!command", "Run shell command directly"),
+        ("@file.rs", "Attach file as context"),
+        ("F1", "Toggle this overlay"),
+    ];
+
+    let mut out = String::new();
+    // Save cursor
+    out.push_str("\x1b[s");
+    out.push_str(HIDE_CURSOR);
+
+    // Indent from left edge
+    let indent = 4u16;
+    let col = indent;
+
+    let mut row = start_row;
+
+    // Top border
+    out.push_str(&goto(row, col));
+    out.push_str(&format!("{accent}{BOX_TL}{BOX_H}{r}{accent}{BOLD}{title}{r}{accent}{title_fill}{BOX_TR}{r}"));
+    row += 1;
+
+    // Blank line
+    let inner_pad: String = " ".repeat(box_w);
+    out.push_str(&goto(row, col));
+    out.push_str(&format!("{accent}{BOX_V}{r}{inner_pad}{accent}{BOX_V}{r}"));
+    row += 1;
+
+    // Shortcut rows
+    for (key, desc) in shortcuts {
+        out.push_str(&goto(row, col));
+        let key_str = format!("{key_bg}{key_fg} {key:<13}{r}");
+        // Pad description to fill the box width
+        let desc_padded = format!("{desc:<36}");
+        out.push_str(&format!(
+            "{accent}{BOX_V}{r}  {key_str} {fgv}{desc_padded}{r} {accent}{BOX_V}{r}",
+        ));
+        row += 1;
+    }
+
+    // Blank line
+    out.push_str(&goto(row, col));
+    out.push_str(&format!("{accent}{BOX_V}{r}{inner_pad}{accent}{BOX_V}{r}"));
+    row += 1;
+
+    // Footer hint
+    out.push_str(&goto(row, col));
+    let footer = format!("  {muted}Press F1 or Esc to close{r}");
+    let footer_pad = box_w.saturating_sub(26);
+    out.push_str(&format!(
+        "{accent}{BOX_V}{r}{footer}{}{accent}{BOX_V}{r}",
+        " ".repeat(footer_pad),
+    ));
+    row += 1;
+
+    // Bottom border
+    out.push_str(&goto(row, col));
+    out.push_str(&format!("{accent}{BOX_BL}{hline}{BOX_BR}{r}"));
+
+    // Restore cursor
+    out.push_str(SHOW_CURSOR);
+    out.push_str("\x1b[u");
+
+    out
 }
 
 /// Format a shutdown message.
@@ -1058,8 +1325,9 @@ mod tests {
         state.model_name = "gemini-2.5-pro".to_string();
         state.tokens_used = 5000;
         let bar = render_status_bar(&state);
-        assert!(bar.contains("/help"));
+        assert!(bar.contains("Agent"));
         assert!(bar.contains("gemini-2.5-pro"));
+        assert!(bar.contains("F1"));
     }
 
     #[test]
@@ -1125,5 +1393,148 @@ mod tests {
         state.input_lines = (0..20).map(|i| format!("line {i}")).collect();
         // Height should be capped at 8 content lines + 2 borders = 10
         assert_eq!(state.input_box_height(), 10);
+    }
+
+    #[test]
+    fn test_format_error_block_chrome() {
+        let err = format_error("Something went wrong");
+        assert!(err.contains("Error"));
+        assert!(err.contains("Something went wrong"));
+        assert!(err.contains("╭"));
+        assert!(err.contains("╰"));
+    }
+
+    #[test]
+    fn test_format_error_multiline() {
+        let err = format_error("line one\nline two");
+        assert!(err.contains("line one"));
+        assert!(err.contains("line two"));
+    }
+
+    #[test]
+    fn test_format_tool_start_block_chrome() {
+        let s = format_tool_start("ReadFile", "src/main.rs");
+        assert!(s.contains("ReadFile"));
+        assert!(s.contains("src/main.rs"));
+        assert!(s.contains("╭"));
+    }
+
+    #[test]
+    fn test_format_tool_end_success() {
+        let s = format_tool_end(true, "200 lines");
+        assert!(s.contains("OK"));
+        assert!(s.contains("200 lines"));
+        assert!(s.contains("╰"));
+    }
+
+    #[test]
+    fn test_format_tool_end_failure() {
+        let s = format_tool_end(false, "timeout");
+        assert!(s.contains("FAIL"));
+        assert!(s.contains("timeout"));
+    }
+
+    #[test]
+    fn test_format_assistant_prefix_block_chrome() {
+        let s = format_assistant_prefix();
+        assert!(s.contains("Elwood"));
+        assert!(s.contains("╭"));
+    }
+
+    #[test]
+    fn test_format_turn_complete_block_chrome() {
+        let s = format_turn_complete(Some("Completed in 3 steps"));
+        assert!(s.contains("Done"));
+        assert!(s.contains("Completed in 3 steps"));
+        assert!(s.contains("╰"));
+    }
+
+    #[test]
+    fn test_format_permission_request_block_chrome() {
+        let s = format_permission_request("BashTool", "rm -rf /tmp/test");
+        assert!(s.contains("Permission Required"));
+        assert!(s.contains("BashTool"));
+        assert!(s.contains("rm -rf"));
+        assert!(s.contains("╭"));
+        assert!(s.contains("╰"));
+    }
+
+    #[test]
+    fn test_format_command_output_block_chrome() {
+        let s = format_command_output("git status", "On branch main", "", Some(0));
+        assert!(s.contains("git status"));
+        assert!(s.contains("On branch main"));
+        assert!(s.contains("exit 0"));
+        assert!(s.contains("╭"));
+        assert!(s.contains("╰"));
+    }
+
+    #[test]
+    fn test_format_command_output_with_stderr() {
+        let s = format_command_output("cargo build", "", "error[E0308]", Some(1));
+        assert!(s.contains("error[E0308]"));
+        assert!(s.contains("exit 1"));
+    }
+
+    #[test]
+    fn test_render_shortcut_overlay() {
+        let state = ScreenState { width: 80, height: 40, ..Default::default() };
+        let overlay = render_shortcut_overlay(&state);
+        assert!(overlay.contains("Keyboard Shortcuts"));
+        assert!(overlay.contains("Ctrl+T"));
+        assert!(overlay.contains("Ctrl+P"));
+        assert!(overlay.contains("F1"));
+        assert!(overlay.contains("╭"));
+        assert!(overlay.contains("╰"));
+    }
+
+    #[test]
+    fn test_format_welcome_contains_hints() {
+        let w = format_welcome();
+        assert!(w.contains("Elwood Terminal"));
+        assert!(w.contains("Quick Start"));
+        assert!(w.contains("Ctrl+T"));
+        assert!(w.contains("@file.rs"));
+    }
+
+    #[test]
+    fn test_render_welcome_at_contains_hints() {
+        let state = ScreenState { width: 80, height: 40, ..Default::default() };
+        let w = render_welcome_at(&state);
+        assert!(w.contains("Elwood Terminal"));
+        assert!(w.contains("Quick Start"));
+        assert!(w.contains("Ctrl+T"));
+    }
+
+    #[test]
+    fn test_status_bar_with_git_info() {
+        let mut state = ScreenState { width: 120, height: 24, ..Default::default() };
+        state.git_info = Some(GitInfo {
+            branch: "main".to_string(),
+            is_dirty: true,
+            ahead: 2,
+            behind: 0,
+        });
+        let bar = render_status_bar(&state);
+        assert!(bar.contains("main"));
+        assert!(bar.contains("*"));
+    }
+
+    #[test]
+    fn test_status_bar_running_with_tool() {
+        let mut state = ScreenState { width: 120, height: 24, ..Default::default() };
+        state.is_running = true;
+        state.active_tool = Some("ReadFile".to_string());
+        state.tool_start = Some(Instant::now());
+        let bar = render_status_bar(&state);
+        assert!(bar.contains("ReadFile"));
+    }
+
+    #[test]
+    fn test_status_bar_terminal_mode() {
+        let mut state = ScreenState { width: 80, height: 24, ..Default::default() };
+        state.input_mode = InputMode::Terminal;
+        let bar = render_status_bar(&state);
+        assert!(bar.contains("Term"));
     }
 }
