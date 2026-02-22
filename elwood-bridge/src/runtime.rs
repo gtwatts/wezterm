@@ -83,6 +83,23 @@ pub enum AgentRequest {
     /// Generate a structured implementation plan for the given description.
     GeneratePlan { description: String },
 
+    /// Run a saved workflow's resolved steps sequentially.
+    WorkflowRun {
+        /// Workflow name (for display).
+        name: String,
+        /// Resolved (command, description, continue_on_error) triples.
+        steps: Vec<(String, String, bool)>,
+    },
+
+    /// Run a command in the background (from `/bg` or `&` suffix).
+    RunBackgroundCommand {
+        command: String,
+        working_dir: Option<String>,
+    },
+
+    /// Kill a running background job.
+    KillJob { job_id: u32 },
+
     /// Gracefully shut down the agent runtime.
     Shutdown,
 }
@@ -170,6 +187,44 @@ pub enum AgentResponse {
         input_tokens: u64,
         output_tokens: u64,
         cost_usd: f64,
+    },
+
+    /// A single workflow step completed.
+    WorkflowStepResult {
+        /// Workflow name.
+        workflow_name: String,
+        /// 0-based step index.
+        step_index: usize,
+        /// Total steps in the workflow.
+        total_steps: usize,
+        /// The resolved command that was run.
+        command: String,
+        /// Step description.
+        description: String,
+        /// Standard output.
+        stdout: String,
+        /// Standard error.
+        stderr: String,
+        /// Process exit code.
+        exit_code: Option<i32>,
+        /// Whether this was the last step (workflow complete).
+        is_last: bool,
+    },
+
+    /// Background job status update.
+    JobUpdate {
+        /// The job ID.
+        job_id: u32,
+        /// New status: "running", "completed", "failed", "cancelled".
+        status: String,
+        /// Optional output chunk (stdout or stderr line).
+        output_chunk: Option<String>,
+        /// Whether this is stderr (vs stdout).
+        is_stderr: bool,
+        /// Exit code (set when status is "completed" or "failed").
+        exit_code: Option<i32>,
+        /// Process ID (set on first "running" update).
+        pid: Option<u32>,
     },
 
     /// An error occurred in the agent.

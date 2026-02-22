@@ -4,6 +4,7 @@
 //! Kept for reference and its test suite.
 #![allow(dead_code)]
 
+use crate::markdown::{is_markdown, render_markdown};
 use crate::runtime::AgentResponse;
 
 // ─── TokyoNight Color Palette (24-bit true color) ────────────────────────
@@ -80,8 +81,12 @@ const THINK_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦",
 pub fn format_response(response: &AgentResponse) -> String {
     match response {
         AgentResponse::ContentDelta(text) => {
-            // Stream content with foreground color
-            format!("{}{}{}", tc::fgp(tc::FG), text, tc::RESET)
+            // Render markdown if detected, otherwise plain text with foreground color
+            if is_markdown(text) {
+                render_markdown(text)
+            } else {
+                format!("{}{}{}", tc::fgp(tc::FG), text, tc::RESET)
+            }
         }
 
         AgentResponse::ToolStart {

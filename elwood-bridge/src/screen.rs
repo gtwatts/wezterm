@@ -154,6 +154,12 @@ pub struct ScreenState {
     pub git_info: Option<GitInfo>,
     /// Ghost text suggestion (dim suffix shown after input cursor).
     pub ghost_text: Option<String>,
+    /// Whether terminal recording is active.
+    pub recording_active: bool,
+    /// Whether recording is paused.
+    pub recording_paused: bool,
+    /// Number of currently running background jobs.
+    pub running_jobs: usize,
 }
 
 impl Default for ScreenState {
@@ -185,6 +191,9 @@ impl Default for ScreenState {
             awaiting_permission: false,
             git_info: None,
             ghost_text: None,
+            recording_active: false,
+            recording_paused: false,
+            running_jobs: 0,
         }
     }
 }
@@ -640,10 +649,35 @@ pub fn render_status_bar(state: &ScreenState) -> String {
         String::new()
     };
 
+    // Recording indicator
+    let rec_chip = if state.recording_active {
+        if state.recording_paused {
+            let sep = format!("{}·{RESET}{sbg}", fgc(MUTED));
+            format!(" {sep} {}{BOLD}\u{23F8} REC{RESET}{sbg}", fgc(WARNING))
+        } else {
+            let sep = format!("{}·{RESET}{sbg}", fgc(MUTED));
+            format!(" {sep} \x1b[1;31m\u{25CF} REC\x1b[0m{sbg}")
+        }
+    } else {
+        String::new()
+    };
+
+    // Background jobs indicator
+    let jobs_chip = if state.running_jobs > 0 {
+        let sep = format!("{}·{RESET}{sbg}", fgc(MUTED));
+        if state.running_jobs == 1 {
+            format!(" {sep} {}{BOLD}\u{2699} 1 job{RESET}{sbg}", fgc(INFO))
+        } else {
+            format!(" {sep} {}{BOLD}\u{2699} {} jobs{RESET}{sbg}", fgc(INFO), state.running_jobs)
+        }
+    } else {
+        String::new()
+    };
+
     // Assemble left section
     out.push_str(&goto(row, 1));
     out.push_str(&format!(
-        "{sbg} {mode_bg}{mode_fg}{BOLD}{mode_label}{RESET}{sbg}{git_chip}{model_chip}{status_chip}",
+        "{sbg} {mode_bg}{mode_fg}{BOLD}{mode_label}{RESET}{sbg}{rec_chip}{jobs_chip}{git_chip}{model_chip}{status_chip}",
     ));
 
     // ── Right section: tokens, cost, elapsed, keyboard hints ────────
@@ -743,8 +777,15 @@ pub fn format_assistant_prefix() -> String {
 }
 
 /// Format a content delta (streaming text).
+///
+/// If the text contains markdown formatting, renders it as rich ANSI output.
+/// Otherwise, applies plain foreground coloring.
 pub fn format_content(text: &str) -> String {
-    format!("{}{text}{RESET}", fgc(FG))
+    if crate::markdown::is_markdown(text) {
+        crate::markdown::render_markdown(text)
+    } else {
+        format!("{}{text}{RESET}", fgc(FG))
+    }
 }
 
 /// Format a tool start event.
@@ -1314,6 +1355,75 @@ pub fn render_suggestion_overlay(
     out
 }
 
+/// Render a compact header line for a block in a listing (e.g. `/bookmarks`).
+///
+/// Layout:
+/// ```text
+///  ▾ $ command   ✓ (1.2s) ★
+/// ```
+///
+/// - Collapse indicator: `▸` collapsed, `▾` expanded
+/// - Exit code badge: green `✓` for 0, red `✗ N` for non-zero
+/// - Duration if available in dim
+/// - `★` bookmark indicator
+/// - Selected blocks get a highlight background
+pub fn render_block_header(block: &crate::block::Block, selected: bool) -> String {
+    let muted = fgc(MUTED);
+    let border_col = fgc(BORDER);
+    let r = RESET;
+
+    let mut out = String::new();
+
+    // Selection highlight background
+    if selected {
+        out.push_str(&bgc(SELECTION));
+    }
+
+    // Collapse indicator
+    let collapse_icon = if block.collapsed { "\u{25b8}" } else { "\u{25be}" };
+    out.push_str(&format!(" {muted}{collapse_icon}{r}"));
+
+    // Restore bg after indicator if selected
+    if selected {
+        out.push_str(&bgc(SELECTION));
+    }
+
+    // Block ID
+    out.push_str(&format!(" {border_col}#{}{r}", block.id));
+    if selected {
+        out.push_str(&bgc(SELECTION));
+    }
+
+    // Exit code badge
+    match block.exit_code {
+        Some(0) => {
+            out.push_str(&format!("  {}{BOLD}\u{2713}{r}", fgc(SUCCESS)));
+            if selected { out.push_str(&bgc(SELECTION)); }
+        }
+        Some(n) => {
+            out.push_str(&format!("  {}{BOLD}\u{2717} {n}{r}", fgc(ERROR)));
+            if selected { out.push_str(&bgc(SELECTION)); }
+        }
+        None => {}
+    }
+
+    // Duration
+    if let Some(dur) = block.duration_secs() {
+        out.push_str(&format!(" {muted}{DIM}({dur:.1}s){r}"));
+        if selected { out.push_str(&bgc(SELECTION)); }
+    }
+
+    // Bookmark indicator
+    if block.bookmarked {
+        out.push_str(&format!(" {}\u{2605}{r}", fgc(WARNING)));
+        if selected { out.push_str(&bgc(SELECTION)); }
+    }
+
+    // Reset at end
+    out.push_str(r);
+    out
+}
+
 /// Format a shutdown message.
 pub fn format_shutdown() -> String {
     format!("\r\n{}{ITALIC}Agent session ended.{RESET}\r\n", fgc(MUTED))
@@ -1674,5 +1784,97 @@ mod tests {
         state.input_mode = InputMode::Terminal;
         let bar = render_status_bar(&state);
         assert!(bar.contains("Term"));
+    }
+
+    // ── Block header rendering tests ────────────────────────────────────
+
+    #[test]
+    fn test_render_block_header_basic() {
+        let block = crate::block::Block {
+            id: 5,
+            prompt_zone: None,
+            input_zone: None,
+            output_zone: Some(crate::block::ZoneRange { start_y: 0, end_y: 10 }),
+            exit_code: Some(0),
+            start_time: None,
+            end_time: None,
+            collapsed: false,
+            bookmarked: false,
+        };
+        let header = render_block_header(&block, false);
+        // Should contain: expand indicator, block ID, success check
+        assert!(header.contains("#5"));
+        assert!(header.contains("\u{2713}")); // checkmark
+        assert!(header.contains("\u{25be}")); // down-pointing triangle (expanded)
+    }
+
+    #[test]
+    fn test_render_block_header_collapsed() {
+        let block = crate::block::Block {
+            id: 3,
+            prompt_zone: None,
+            input_zone: None,
+            output_zone: Some(crate::block::ZoneRange { start_y: 0, end_y: 5 }),
+            exit_code: None,
+            start_time: None,
+            end_time: None,
+            collapsed: true,
+            bookmarked: false,
+        };
+        let header = render_block_header(&block, false);
+        assert!(header.contains("\u{25b8}")); // right-pointing triangle (collapsed)
+    }
+
+    #[test]
+    fn test_render_block_header_bookmarked() {
+        let block = crate::block::Block {
+            id: 7,
+            prompt_zone: None,
+            input_zone: None,
+            output_zone: Some(crate::block::ZoneRange { start_y: 0, end_y: 5 }),
+            exit_code: None,
+            start_time: None,
+            end_time: None,
+            collapsed: false,
+            bookmarked: true,
+        };
+        let header = render_block_header(&block, false);
+        assert!(header.contains("\u{2605}")); // star
+    }
+
+    #[test]
+    fn test_render_block_header_error_exit() {
+        let block = crate::block::Block {
+            id: 1,
+            prompt_zone: None,
+            input_zone: None,
+            output_zone: Some(crate::block::ZoneRange { start_y: 0, end_y: 5 }),
+            exit_code: Some(127),
+            start_time: None,
+            end_time: None,
+            collapsed: false,
+            bookmarked: false,
+        };
+        let header = render_block_header(&block, false);
+        assert!(header.contains("\u{2717}")); // cross
+        assert!(header.contains("127"));
+    }
+
+    #[test]
+    fn test_render_block_header_selected() {
+        let block = crate::block::Block {
+            id: 2,
+            prompt_zone: None,
+            input_zone: None,
+            output_zone: Some(crate::block::ZoneRange { start_y: 0, end_y: 5 }),
+            exit_code: Some(0),
+            start_time: None,
+            end_time: None,
+            collapsed: false,
+            bookmarked: false,
+        };
+        let header = render_block_header(&block, true);
+        // Selected header should have SELECTION background color escape
+        assert!(header.contains("\x1b[48;2;40;44;66m")); // bgc(SELECTION)
     }
 }

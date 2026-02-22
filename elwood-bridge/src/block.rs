@@ -414,11 +414,25 @@ impl BlockManager {
             .collect()
     }
 
+    /// Return `(index, &Block)` pairs for all bookmarked blocks (in order).
+    pub fn bookmarked_blocks_with_index(&self) -> Vec<(usize, &Block)> {
+        self.blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.bookmarked)
+            .collect()
+    }
+
     // ── Selected block ──────────────────────────────────────────────────────
 
     /// The index of the currently selected block (for keyboard navigation).
     pub fn selected_index(&self) -> Option<usize> {
         self.selected
+    }
+
+    /// Get a reference to the currently selected block.
+    pub fn selected_block(&self) -> Option<&Block> {
+        self.selected.and_then(|i| self.blocks.get(i))
     }
 
     /// Select the block at `index`.  Clamps to valid range.
@@ -431,6 +445,84 @@ impl BlockManager {
     /// Deselect the current block.
     pub fn deselect(&mut self) {
         self.selected = None;
+    }
+
+    /// Move selection to the next block.  If nothing is selected, selects
+    /// the first block.  Wraps at the end.
+    pub fn navigate_next_selected(&mut self) {
+        if self.blocks.is_empty() {
+            return;
+        }
+        match self.selected {
+            None => self.selected = Some(0),
+            Some(i) if i + 1 < self.blocks.len() => self.selected = Some(i + 1),
+            Some(_) => self.selected = Some(self.blocks.len() - 1),
+        }
+    }
+
+    /// Move selection to the previous block.  If nothing is selected, selects
+    /// the last block.  Wraps at the beginning.
+    pub fn navigate_prev_selected(&mut self) {
+        if self.blocks.is_empty() {
+            return;
+        }
+        match self.selected {
+            None => self.selected = Some(self.blocks.len() - 1),
+            Some(0) => self.selected = Some(0),
+            Some(i) => self.selected = Some(i - 1),
+        }
+    }
+
+    /// Toggle collapsed state of the block at `index`.
+    ///
+    /// Returns the new collapsed state, or `None` if index is out of range.
+    pub fn toggle_collapse_at(&mut self, index: usize) -> Option<bool> {
+        let block = self.blocks.get_mut(index)?;
+        block.collapsed = !block.collapsed;
+        Some(block.collapsed)
+    }
+
+    /// Toggle bookmarked state of the block at `index`.
+    ///
+    /// Returns the new bookmarked state, or `None` if index is out of range.
+    pub fn toggle_bookmark_at(&mut self, index: usize) -> Option<bool> {
+        let block = self.blocks.get_mut(index)?;
+        block.bookmarked = !block.bookmarked;
+        Some(block.bookmarked)
+    }
+
+    /// Export a single block as a markdown string.
+    ///
+    /// Includes block metadata (exit code, duration) and placeholder text
+    /// for command/output (since the actual terminal text is not stored here).
+    pub fn export_block_markdown(&self, index: usize) -> Option<String> {
+        let block = self.blocks.get(index)?;
+        let mut md = String::new();
+        md.push_str(&format!("## Block {}\n\n", block.id));
+
+        if let Some(exit) = block.exit_code {
+            md.push_str(&format!("**Exit code:** {exit}\n"));
+        }
+        if let Some(dur) = block.duration_secs() {
+            md.push_str(&format!("**Duration:** {dur:.1}s\n"));
+        }
+        if block.bookmarked {
+            md.push_str("**Bookmarked:** yes\n");
+        }
+        md.push('\n');
+
+        // Row ranges (for cross-referencing with terminal content)
+        if let Some(z) = block.prompt_zone {
+            md.push_str(&format!("Prompt rows: {}..{}\n", z.start_y, z.end_y));
+        }
+        if let Some(z) = block.input_zone {
+            md.push_str(&format!("Input rows: {}..{}\n", z.start_y, z.end_y));
+        }
+        if let Some(z) = block.output_zone {
+            md.push_str(&format!("Output rows: {}..{}\n", z.start_y, z.end_y));
+        }
+
+        Some(md)
     }
 
     // ── Internal ────────────────────────────────────────────────────────────
@@ -751,5 +843,231 @@ mod tests {
         };
         assert_eq!(block.first_row(), Some(0));
         assert_eq!(block.last_row(), Some(9));
+    }
+
+    // ── Tests for selected block navigation ─────────────────────────────
+
+    #[test]
+    fn test_selected_block_initially_none() {
+        let mgr = BlockManager::new();
+        assert_eq!(mgr.selected_index(), None);
+        assert!(mgr.selected_block().is_none());
+    }
+
+    #[test]
+    fn test_navigate_next_selected_empty() {
+        let mut mgr = BlockManager::new();
+        mgr.navigate_next_selected();
+        // No panic, stays None
+        assert_eq!(mgr.selected_index(), None);
+    }
+
+    #[test]
+    fn test_navigate_prev_selected_empty() {
+        let mut mgr = BlockManager::new();
+        mgr.navigate_prev_selected();
+        // No panic, stays None
+        assert_eq!(mgr.selected_index(), None);
+    }
+
+    #[test]
+    fn test_navigate_next_selected_from_none() {
+        let mut mgr = BlockManager::new();
+        let zones = vec![
+            make_zone(0, 3, SemanticType::Output),
+            make_zone(5, 8, SemanticType::Output),
+        ];
+        mgr.sync_from_zones(&zones);
+
+        // First call selects block 0
+        mgr.navigate_next_selected();
+        assert_eq!(mgr.selected_index(), Some(0));
+        assert_eq!(mgr.selected_block().unwrap().id, mgr.blocks()[0].id);
+
+        // Second call moves to block 1
+        mgr.navigate_next_selected();
+        assert_eq!(mgr.selected_index(), Some(1));
+
+        // Third call stays at block 1 (end of list)
+        mgr.navigate_next_selected();
+        assert_eq!(mgr.selected_index(), Some(1));
+    }
+
+    #[test]
+    fn test_navigate_prev_selected_from_none() {
+        let mut mgr = BlockManager::new();
+        let zones = vec![
+            make_zone(0, 3, SemanticType::Output),
+            make_zone(5, 8, SemanticType::Output),
+        ];
+        mgr.sync_from_zones(&zones);
+
+        // First call selects last block
+        mgr.navigate_prev_selected();
+        assert_eq!(mgr.selected_index(), Some(1));
+
+        // Second call moves to block 0
+        mgr.navigate_prev_selected();
+        assert_eq!(mgr.selected_index(), Some(0));
+
+        // Third call stays at block 0 (beginning of list)
+        mgr.navigate_prev_selected();
+        assert_eq!(mgr.selected_index(), Some(0));
+    }
+
+    #[test]
+    fn test_navigate_selected_single_block() {
+        let mut mgr = BlockManager::new();
+        let zones = vec![make_zone(0, 5, SemanticType::Output)];
+        mgr.sync_from_zones(&zones);
+
+        mgr.navigate_next_selected();
+        assert_eq!(mgr.selected_index(), Some(0));
+
+        mgr.navigate_next_selected();
+        assert_eq!(mgr.selected_index(), Some(0)); // Can't go past the only block
+
+        mgr.navigate_prev_selected();
+        assert_eq!(mgr.selected_index(), Some(0)); // Can't go before the only block
+    }
+
+    // ── Tests for toggle by index ───────────────────────────────────────
+
+    #[test]
+    fn test_toggle_collapse_at_valid() {
+        let mut mgr = BlockManager::new();
+        let zones = vec![
+            make_zone(0, 3, SemanticType::Output),
+            make_zone(5, 8, SemanticType::Output),
+        ];
+        mgr.sync_from_zones(&zones);
+
+        assert_eq!(mgr.toggle_collapse_at(0), Some(true));
+        assert!(mgr.blocks()[0].collapsed);
+        assert!(!mgr.blocks()[1].collapsed);
+
+        assert_eq!(mgr.toggle_collapse_at(0), Some(false));
+        assert!(!mgr.blocks()[0].collapsed);
+    }
+
+    #[test]
+    fn test_toggle_collapse_at_out_of_range() {
+        let mut mgr = BlockManager::new();
+        let zones = vec![make_zone(0, 3, SemanticType::Output)];
+        mgr.sync_from_zones(&zones);
+
+        assert_eq!(mgr.toggle_collapse_at(5), None);
+    }
+
+    #[test]
+    fn test_toggle_bookmark_at_valid() {
+        let mut mgr = BlockManager::new();
+        let zones = vec![
+            make_zone(0, 3, SemanticType::Output),
+            make_zone(5, 8, SemanticType::Output),
+        ];
+        mgr.sync_from_zones(&zones);
+
+        assert_eq!(mgr.toggle_bookmark_at(1), Some(true));
+        assert!(!mgr.blocks()[0].bookmarked);
+        assert!(mgr.blocks()[1].bookmarked);
+    }
+
+    #[test]
+    fn test_toggle_bookmark_at_out_of_range() {
+        let mut mgr = BlockManager::new();
+        assert_eq!(mgr.toggle_bookmark_at(0), None);
+    }
+
+    // ── Tests for bookmarked_blocks_with_index ──────────────────────────
+
+    #[test]
+    fn test_bookmarked_blocks_with_index() {
+        let mut mgr = BlockManager::new();
+        let zones = vec![
+            make_zone(0, 3, SemanticType::Output),
+            make_zone(5, 8, SemanticType::Output),
+            make_zone(10, 15, SemanticType::Output),
+        ];
+        mgr.sync_from_zones(&zones);
+
+        mgr.toggle_bookmark_at(0);
+        mgr.toggle_bookmark_at(2);
+
+        let bookmarked = mgr.bookmarked_blocks_with_index();
+        assert_eq!(bookmarked.len(), 2);
+        assert_eq!(bookmarked[0].0, 0);
+        assert_eq!(bookmarked[1].0, 2);
+    }
+
+    #[test]
+    fn test_bookmarked_blocks_with_index_empty() {
+        let mgr = BlockManager::new();
+        assert!(mgr.bookmarked_blocks_with_index().is_empty());
+    }
+
+    // ── Tests for export_block_markdown ──────────────────────────────────
+
+    #[test]
+    fn test_export_block_markdown_basic() {
+        let mut mgr = BlockManager::new();
+        let zones = vec![
+            make_zone(0, 0, SemanticType::Prompt),
+            make_zone(1, 1, SemanticType::Input),
+            make_zone(2, 5, SemanticType::Output),
+        ];
+        mgr.sync_from_zones(&zones);
+
+        let md = mgr.export_block_markdown(0);
+        assert!(md.is_some());
+        let md = md.unwrap();
+        assert!(md.contains("## Block"));
+        assert!(md.contains("Prompt rows"));
+        assert!(md.contains("Input rows"));
+        assert!(md.contains("Output rows"));
+    }
+
+    #[test]
+    fn test_export_block_markdown_with_metadata() {
+        let mut mgr = BlockManager::new();
+        mgr.push_agent_block(10);
+        mgr.extend_output(20);
+        mgr.finish_block(Some(42));
+        mgr.toggle_bookmark_at(0);
+
+        let md = mgr.export_block_markdown(0).unwrap();
+        assert!(md.contains("Exit code:** 42"));
+        assert!(md.contains("Duration:**"));
+        assert!(md.contains("Bookmarked:** yes"));
+    }
+
+    #[test]
+    fn test_export_block_markdown_out_of_range() {
+        let mgr = BlockManager::new();
+        assert!(mgr.export_block_markdown(0).is_none());
+    }
+
+    // ── Test select and deselect ────────────────────────────────────────
+
+    #[test]
+    fn test_select_clamps_to_range() {
+        let mut mgr = BlockManager::new();
+        let zones = vec![make_zone(0, 3, SemanticType::Output)];
+        mgr.sync_from_zones(&zones);
+
+        mgr.select(100);
+        assert_eq!(mgr.selected_index(), Some(0)); // clamped to len-1 = 0
+    }
+
+    #[test]
+    fn test_deselect() {
+        let mut mgr = BlockManager::new();
+        let zones = vec![make_zone(0, 3, SemanticType::Output)];
+        mgr.sync_from_zones(&zones);
+
+        mgr.select(0);
+        assert_eq!(mgr.selected_index(), Some(0));
+        mgr.deselect();
+        assert_eq!(mgr.selected_index(), None);
     }
 }

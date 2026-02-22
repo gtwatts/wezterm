@@ -40,6 +40,7 @@ use crate::context;
 use crate::diff;
 use crate::lua_api::{self, LuaEventArg, LuaEventDispatcher};
 use crate::file_browser::FileTree;
+use crate::fuzzy_finder::{self, FuzzyFinder, FileSource, SlashCommandSource, HistorySource, FuzzyAction};
 use crate::semantic_bridge::SemanticBridge;
 use crate::diff_viewer::{DiffViewer, ReviewAction};
 use crate::editor::InputEditor;
@@ -199,6 +200,10 @@ pub struct ElwoodPane {
     plan_viewer: Mutex<Option<PlanViewer>>,
     /// Toast notification manager for proactive suggestions and status updates.
     toast_manager: Mutex<ToastManager>,
+    /// Fuzzy finder overlay (Ctrl+F).
+    fuzzy_finder: Mutex<Option<FuzzyFinder>>,
+    /// Terminal session recorder (asciinema v2 format).
+    recorder: Mutex<crate::recording::SessionRecorder>,
 }
 
 /// A pending permission request waiting for user approval.
@@ -304,6 +309,8 @@ impl ElwoodPane {
             commit_view: Mutex::new(None),
             plan_viewer: Mutex::new(None),
             toast_manager: Mutex::new(ToastManager::new()),
+            fuzzy_finder: Mutex::new(None),
+            recorder: Mutex::new(crate::recording::SessionRecorder::new()),
         };
 
         // Start observing sibling panes for cross-pane awareness.
@@ -719,8 +726,42 @@ impl ElwoodPane {
                             );
                             ss.cost += cost_usd;
                         }
+                        AgentResponse::WorkflowStepResult {
+                            ref exit_code, is_last, ..
+                        } => {
+                            if *is_last {
+                                // Workflow finished — return to idle
+                                *self.state.lock() = PaneState::Idle;
+                                let mut ss = self.screen.lock();
+                                ss.is_running = false;
+                                ss.active_tool = None;
+                                ss.tool_start = None;
+                                ss.task_elapsed_frozen = ss.task_start
+                                    .map(|s| s.elapsed().as_secs());
+                                ss.task_start = None;
+                            } else {
+                                // Show step progress in active tool slot
+                                let mut ss = self.screen.lock();
+                                if let AgentResponse::WorkflowStepResult {
+                                    ref workflow_name,
+                                    step_index,
+                                    total_steps,
+                                    ..
+                                } = response {
+                                    ss.active_tool = Some(format!(
+                                        "{workflow_name} [{}/{}]",
+                                        step_index + 1,
+                                        total_steps,
+                                    ));
+                                }
+                                let _ = exit_code; // suppress unused warning
+                            }
+                        }
                         AgentResponse::Shutdown => {
                             *self.dead.lock() = true;
+                        }
+                        AgentResponse::JobUpdate { .. } => {
+                            // Handled by jobs panel (not yet wired)
                         }
                     }
 
@@ -1229,10 +1270,62 @@ impl ElwoodPane {
             }
             CommandResult::ExportFormatted { path, format } => { self.write_ansi(&screen::format_command_response(&format!("Export as {format} to: {path}"))); }
             CommandResult::ImportSession { path } => { self.write_ansi(&screen::format_command_response(&format!("Import session from: {path}"))); }
+            CommandResult::ListBookmarks => {
+                self.handle_list_bookmarks();
+            }
+            CommandResult::ExportBlock { index } => {
+                self.handle_export_block(index);
+            }
+            CommandResult::RecordStart { filename } => {
+                self.handle_record_start(filename.as_deref());
+            }
+            CommandResult::RecordStop => {
+                self.handle_record_stop();
+            }
+            CommandResult::RecordPause => {
+                self.handle_record_pause();
+            }
+            CommandResult::RecordResume => {
+                self.handle_record_resume();
+            }
+            CommandResult::WorkflowResult(wf_result) => {
+                use crate::workflow::WorkflowCommandResult;
+                match wf_result {
+                    WorkflowCommandResult::ChatMessage(msg) => {
+                        self.write_ansi(&screen::format_command_response(&msg));
+                    }
+                    WorkflowCommandResult::RunSteps { name, steps } => {
+                        // Show workflow header in chat
+                        let step_count = steps.len();
+                        self.write_ansi(&screen::format_command_response(
+                            &format!("Running workflow '{name}' ({step_count} steps)..."),
+                        ));
+                        // Mark as running
+                        {
+                            let mut ss = self.screen.lock();
+                            ss.is_running = true;
+                            ss.task_start = Some(Instant::now());
+                            ss.task_elapsed_frozen = None;
+                        }
+                        *self.state.lock() = PaneState::Running;
+                        self.refresh_status_bar();
+                        // Send to agent runtime for execution
+                        let _ = self.bridge.send_request(AgentRequest::WorkflowRun {
+                            name,
+                            steps,
+                        });
+                    }
+                }
+            }
             CommandResult::Unknown(name) => {
                 self.write_ansi(&screen::format_command_response(&format!(
                     "Unknown command: /{name}\nType /help for available commands."
                 )));
+            }
+            CommandResult::OpenJobsPanel
+            | CommandResult::RunBackground { .. }
+            | CommandResult::KillJob { .. } => {
+                // Handled by jobs panel integration (not yet wired)
             }
         }
     }
@@ -1333,6 +1426,170 @@ impl ElwoodPane {
         self.write_ansi(&screen::format_command_response(&msg));
     }
 
+    /// `/record start` — begin terminal recording.
+    fn handle_record_start(&self, filename: Option<&str>) {
+        let mut rec = self.recorder.lock();
+        if rec.is_recording() {
+            drop(rec);
+            self.write_ansi(&screen::format_command_response(
+                "Already recording. Use /record stop first."
+            ));
+            return;
+        }
+        let ss = self.screen.lock();
+        let (w, h) = (ss.width as u32, ss.height as u32);
+        drop(ss);
+
+        let path = if let Some(name) = filename {
+            let p = std::path::PathBuf::from(name);
+            rec.start_to(p.clone(), w, h);
+            p
+        } else {
+            rec.start(w, h)
+        };
+        drop(rec);
+
+        {
+            let mut ss = self.screen.lock();
+            ss.recording_active = true;
+            ss.recording_paused = false;
+        }
+        self.refresh_status_bar();
+        self.write_ansi(&screen::format_command_response(&format!(
+            "Recording to {}", path.display()
+        )));
+    }
+
+    /// `/record stop` — stop terminal recording.
+    fn handle_record_stop(&self) {
+        let mut rec = self.recorder.lock();
+        if !rec.is_recording() {
+            drop(rec);
+            self.write_ansi(&screen::format_command_response(
+                "Not recording. Use /record start first."
+            ));
+            return;
+        }
+        let events = rec.event_count();
+        let duration = rec.elapsed_secs();
+        let path = rec.stop();
+        drop(rec);
+
+        {
+            let mut ss = self.screen.lock();
+            ss.recording_active = false;
+            ss.recording_paused = false;
+        }
+        self.refresh_status_bar();
+
+        let path_str = path.map(|p| p.display().to_string()).unwrap_or_default();
+        self.write_ansi(&screen::format_command_response(&format!(
+            "Recording saved to {path_str} ({events} events, {duration:.1}s)"
+        )));
+    }
+
+    /// `/record pause` — pause terminal recording.
+    fn handle_record_pause(&self) {
+        let mut rec = self.recorder.lock();
+        if !rec.is_recording() {
+            drop(rec);
+            self.write_ansi(&screen::format_command_response("Not recording."));
+            return;
+        }
+        if rec.is_paused() {
+            drop(rec);
+            self.write_ansi(&screen::format_command_response("Recording already paused."));
+            return;
+        }
+        rec.pause();
+        drop(rec);
+        {
+            let mut ss = self.screen.lock();
+            ss.recording_paused = true;
+        }
+        self.refresh_status_bar();
+        self.write_ansi(&screen::format_command_response("Recording paused"));
+    }
+
+    /// `/record resume` — resume terminal recording.
+    fn handle_record_resume(&self) {
+        let mut rec = self.recorder.lock();
+        if !rec.is_recording() {
+            drop(rec);
+            self.write_ansi(&screen::format_command_response("Not recording."));
+            return;
+        }
+        if !rec.is_paused() {
+            drop(rec);
+            self.write_ansi(&screen::format_command_response("Recording is not paused."));
+            return;
+        }
+        rec.resume();
+        drop(rec);
+        {
+            let mut ss = self.screen.lock();
+            ss.recording_paused = false;
+        }
+        self.refresh_status_bar();
+        self.write_ansi(&screen::format_command_response("Recording resumed"));
+    }
+
+    /// `/bookmarks` — list all bookmarked blocks with their header summaries.
+    fn handle_list_bookmarks(&self) {
+        let mgr = self.block_manager.lock();
+        let bookmarked = mgr.bookmarked_blocks_with_index();
+
+        if bookmarked.is_empty() {
+            self.write_ansi(&screen::format_command_response(
+                "No bookmarked blocks.\nUse ] / [ to navigate blocks, then 'b' to bookmark.",
+            ));
+            return;
+        }
+
+        let mut msg = format!("Bookmarked blocks ({}):\n\n", bookmarked.len());
+        for (idx, block) in &bookmarked {
+            let exit_str = match block.exit_code {
+                Some(0) => " [ok]".to_string(),
+                Some(n) => format!(" [exit {n}]"),
+                None => String::new(),
+            };
+            let dur_str = block
+                .duration_secs()
+                .map(|d| format!(" ({d:.1}s)"))
+                .unwrap_or_default();
+            msg.push_str(&format!(
+                "  [{idx}] Block #{}{exit_str}{dur_str}\n",
+                block.id,
+            ));
+        }
+        msg.push_str("\nUse /export block <index> to export a block as markdown.");
+        drop(mgr);
+        self.write_ansi(&screen::format_command_response(&msg));
+    }
+
+    /// `/export block [index]` — export a block as markdown.
+    fn handle_export_block(&self, index: Option<usize>) {
+        let mgr = self.block_manager.lock();
+
+        // Determine which block to export: explicit index, selected, or last
+        let target_index = index
+            .or_else(|| mgr.selected_index())
+            .unwrap_or_else(|| mgr.len().saturating_sub(1));
+
+        match mgr.export_block_markdown(target_index) {
+            Some(markdown) => {
+                drop(mgr);
+                self.write_ansi(&screen::format_command_response(&markdown));
+            }
+            None => {
+                drop(mgr);
+                self.write_ansi(&screen::format_command_response(&format!(
+                    "No block at index {target_index}.\nUse /bookmarks to see available blocks."
+                )));
+            }
+        }
+    }
+
     /// Sync the InputEditor's current state into ScreenState for rendering.
     fn sync_editor_to_screen(&self) {
         let editor = self.input_editor.lock();
@@ -1393,6 +1650,9 @@ impl ElwoodPane {
                 self.history_search.lock().open();
                 self.render_history_search_overlay();
             }
+            "fuzzy_finder" => {
+                self.open_fuzzy_finder();
+            }
             cmd if cmd.starts_with('/') => {
                 // Route slash commands through the normal command handler
                 if let Some((cmd_name, args)) = commands::parse_command(cmd) {
@@ -1424,6 +1684,139 @@ impl ElwoodPane {
         drop(hs);
         if !rendered.is_empty() {
             self.write_ansi(&rendered);
+        }
+    }
+
+    // ── Fuzzy finder (Ctrl+F) ──────────────────────────────────────────────
+
+    /// Open the fuzzy finder overlay with all sources.
+    fn open_fuzzy_finder(&self) {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+
+        // Collect history texts for the HistorySource
+        let history_texts: Vec<String> = self
+            .history_search
+            .lock()
+            .entries()
+            .iter()
+            .rev()
+            .take(500)
+            .map(|r| r.text.clone())
+            .collect();
+
+        let sources: Vec<Box<dyn fuzzy_finder::FuzzySource>> = vec![
+            Box::new(FileSource::new(cwd)),
+            Box::new(SlashCommandSource::new()),
+            Box::new(HistorySource::from_texts(history_texts)),
+        ];
+        *self.fuzzy_finder.lock() = Some(FuzzyFinder::new(sources));
+        self.render_fuzzy_finder_overlay();
+    }
+
+    /// Render the fuzzy finder overlay into the virtual terminal.
+    fn render_fuzzy_finder_overlay(&self) {
+        let ff = self.fuzzy_finder.lock();
+        if let Some(ref finder) = *ff {
+            let ss = self.screen.lock();
+            let rendered = finder.render(ss.width as usize, ss.height as usize);
+            drop(ss);
+            drop(ff);
+            if !rendered.is_empty() {
+                self.write_ansi(&rendered);
+            }
+        }
+    }
+
+    /// Handle a key event while the fuzzy finder is open.
+    fn handle_fuzzy_finder_key(&self, key: KeyCode, mods: KeyModifiers) {
+        match key {
+            KeyCode::Escape => {
+                *self.fuzzy_finder.lock() = None;
+            }
+            KeyCode::Enter => {
+                let action = self
+                    .fuzzy_finder
+                    .lock()
+                    .as_ref()
+                    .and_then(|f| f.selected_action().cloned());
+                *self.fuzzy_finder.lock() = None;
+                if let Some(action) = action {
+                    self.execute_fuzzy_action(action);
+                }
+            }
+            KeyCode::UpArrow => {
+                if let Some(ref mut f) = *self.fuzzy_finder.lock() {
+                    f.select_prev();
+                }
+                self.render_fuzzy_finder_overlay();
+            }
+            KeyCode::DownArrow => {
+                if let Some(ref mut f) = *self.fuzzy_finder.lock() {
+                    f.select_next();
+                }
+                self.render_fuzzy_finder_overlay();
+            }
+            KeyCode::Tab if mods.is_empty() => {
+                if let Some(ref mut f) = *self.fuzzy_finder.lock() {
+                    f.cycle_tab();
+                }
+                self.render_fuzzy_finder_overlay();
+            }
+            KeyCode::Backspace => {
+                if let Some(ref mut f) = *self.fuzzy_finder.lock() {
+                    f.backspace();
+                }
+                self.render_fuzzy_finder_overlay();
+            }
+            KeyCode::Char(c) if mods.is_empty() || mods == KeyModifiers::SHIFT => {
+                if let Some(ref mut f) = *self.fuzzy_finder.lock() {
+                    f.type_char(c);
+                }
+                self.render_fuzzy_finder_overlay();
+            }
+            _ => {}
+        }
+    }
+
+    /// Execute the action from a selected fuzzy finder item.
+    fn execute_fuzzy_action(&self, action: FuzzyAction) {
+        match action {
+            FuzzyAction::InsertText(text) => {
+                let mut editor = self.input_editor.lock();
+                editor.clear();
+                for ch in text.chars() {
+                    editor.insert_char(ch);
+                }
+                drop(editor);
+                self.sync_editor_to_screen();
+            }
+            FuzzyAction::OpenFile(path) => {
+                // Insert @file reference into the input
+                let display = path.to_string_lossy();
+                let text = format!("@{display} ");
+                let mut editor = self.input_editor.lock();
+                for ch in text.chars() {
+                    editor.insert_char(ch);
+                }
+                drop(editor);
+                self.sync_editor_to_screen();
+            }
+            FuzzyAction::AttachContext(ctx) => {
+                let text = format!("@{ctx} ");
+                let mut editor = self.input_editor.lock();
+                for ch in text.chars() {
+                    editor.insert_char(ch);
+                }
+                drop(editor);
+                self.sync_editor_to_screen();
+            }
+            FuzzyAction::ScrollToBlock(idx) => {
+                let mut bm = self.block_manager.lock();
+                bm.select(idx);
+            }
+            FuzzyAction::ExecuteCommand(cmd) => {
+                self.execute_palette_command(&cmd);
+            }
         }
     }
 
@@ -2053,6 +2446,30 @@ fn format_response_for_chat(response: &AgentResponse) -> String {
         AgentResponse::PtyScreenSnapshot { .. } => String::new(),
         // PaneSnapshots are handled by the observer
         AgentResponse::PaneSnapshots { .. } => String::new(),
+        AgentResponse::WorkflowStepResult {
+            step_index,
+            total_steps,
+            command,
+            description,
+            stdout,
+            stderr,
+            exit_code,
+            is_last,
+            ..
+        } => {
+            let step_label = format!(
+                "[{}/{}] {}",
+                step_index + 1,
+                total_steps,
+                if description.is_empty() { command.as_str() } else { description.as_str() },
+            );
+            let mut out = screen::format_command_prompt(&step_label);
+            out.push_str(&screen::format_command_output(command, stdout, stderr, *exit_code));
+            if *is_last {
+                out.push_str(&screen::format_turn_complete(Some("Workflow complete")));
+            }
+            out
+        }
         AgentResponse::Error(msg) => screen::format_error(msg),
         AgentResponse::Shutdown => screen::format_shutdown(),
         // Other response types handled by subsystems
@@ -2425,6 +2842,12 @@ impl mux::pane::Pane for ElwoodPane {
             }
         }
 
+        // ── Fuzzy finder mode: route all keys to fuzzy finder ──────
+        if self.fuzzy_finder.lock().is_some() {
+            self.handle_fuzzy_finder_key(key, mods);
+            return Ok(());
+        }
+
         // F2 toggles file browser
         if key == KeyCode::Function(2) && mods.is_empty() {
             self.toggle_file_browser();
@@ -2476,9 +2899,9 @@ impl mux::pane::Pane for ElwoodPane {
 
         // ── Agent mode: route keys to InputEditor ────────────────────────────
 
-        // Ctrl+F: quick-fix — send last detected error to the agent
+        // Ctrl+F: open fuzzy finder overlay
         if key == KeyCode::Char('f') && mods == KeyModifiers::CTRL {
-            self.handle_quick_fix();
+            self.open_fuzzy_finder();
             return Ok(());
         }
 
@@ -2645,6 +3068,45 @@ impl mux::pane::Pane for ElwoodPane {
             // ── Copy current block output (Ctrl+Shift+C) ─────────────
             KeyCode::Char('c') if mods == KeyModifiers::CTRL | KeyModifiers::SHIFT => {
                 self.copy_current_block_output();
+                editor_changed = false;
+            }
+
+            // ── Selected-block navigation ([ and ]) ──────────────────
+            // Only when input is empty so we don't eat characters mid-typing.
+            KeyCode::Char('[') if mods.is_empty() && self.input_editor.lock().is_empty() => {
+                let mut mgr = self.block_manager.lock();
+                mgr.navigate_prev_selected();
+                if let Some(first_row) = mgr.selected_block().and_then(|b| b.first_row()) {
+                    drop(mgr);
+                    self.scroll_to_row(first_row);
+                }
+                editor_changed = false;
+            }
+            KeyCode::Char(']') if mods.is_empty() && self.input_editor.lock().is_empty() => {
+                let mut mgr = self.block_manager.lock();
+                mgr.navigate_next_selected();
+                if let Some(first_row) = mgr.selected_block().and_then(|b| b.first_row()) {
+                    drop(mgr);
+                    self.scroll_to_row(first_row);
+                }
+                editor_changed = false;
+            }
+
+            // ── Toggle collapse on selected block (c when input empty) ──
+            KeyCode::Char('c') if mods.is_empty() && self.input_editor.lock().is_empty() => {
+                let mut mgr = self.block_manager.lock();
+                if let Some(idx) = mgr.selected_index() {
+                    mgr.toggle_collapse_at(idx);
+                }
+                editor_changed = false;
+            }
+
+            // ── Toggle bookmark on selected block (b when input empty) ──
+            KeyCode::Char('b') if mods.is_empty() && self.input_editor.lock().is_empty() => {
+                let mut mgr = self.block_manager.lock();
+                if let Some(idx) = mgr.selected_index() {
+                    mgr.toggle_bookmark_at(idx);
+                }
                 editor_changed = false;
             }
 

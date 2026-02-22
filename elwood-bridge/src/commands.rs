@@ -68,12 +68,32 @@ pub enum CommandResult {
     GitStatus,
     /// List sibling terminal panes (`/panes`).
     ListPanes,
+    /// Start recording terminal output (`/record start`).
+    RecordStart { filename: Option<String> },
+    /// Stop recording (`/record stop`).
+    RecordStop,
+    /// Pause recording (`/record pause`).
+    RecordPause,
+    /// Resume recording (`/record resume`).
+    RecordResume,
     /// Switch to a named model (`/model <name>`).
     SwitchModel { model_name: String },
     /// List saved plans (`/plan list`).
     ListPlans,
     /// Resume a saved plan by ID prefix (`/plan resume <id>`).
     ResumePlan { id_prefix: String },
+    /// List bookmarked blocks (`/bookmarks`).
+    ListBookmarks,
+    /// Export a specific block as markdown (`/export block [index]`).
+    ExportBlock { index: Option<usize> },
+    /// Workflow command result (display message or run steps).
+    WorkflowResult(crate::workflow::WorkflowCommandResult),
+    /// Open the background jobs panel (`/jobs`).
+    OpenJobsPanel,
+    /// Run a command in the background (`/bg <command>`).
+    RunBackground { command: String },
+    /// Kill a running background job (`/kill <id>`).
+    KillJob { job_id: u32 },
     /// Unknown or invalid command.
     Unknown(String),
 }
@@ -131,6 +151,36 @@ pub fn get_commands() -> Vec<SlashCommand> {
             description: "List sibling terminal panes and their content",
             usage: "/panes",
         },
+        SlashCommand {
+            name: "bookmarks",
+            description: "List bookmarked blocks",
+            usage: "/bookmarks",
+        },
+        SlashCommand {
+            name: "record",
+            description: "Terminal recording (start/stop/pause/resume)",
+            usage: "/record <start [file]|stop|pause|resume>",
+        },
+        SlashCommand {
+            name: "workflow",
+            description: "Saved command workflows (list/save/run/show/delete)",
+            usage: "/workflow [list|save|show|run|delete] <name>",
+        },
+        SlashCommand {
+            name: "jobs",
+            description: "Show background jobs panel",
+            usage: "/jobs",
+        },
+        SlashCommand {
+            name: "bg",
+            description: "Run a command in the background",
+            usage: "/bg <command>",
+        },
+        SlashCommand {
+            name: "kill",
+            description: "Kill a running background job",
+            usage: "/kill <job_id>",
+        },
     ]
 }
 
@@ -172,6 +222,14 @@ pub fn execute_command(name: &str, args: &str, model_name: &str) -> CommandResul
         "diff" => execute_diff(args),
         "git" => execute_git(args),
         "panes" => CommandResult::ListPanes,
+        "bookmarks" => CommandResult::ListBookmarks,
+        "record" => execute_record(args),
+        "workflow" | "wf" => {
+            CommandResult::WorkflowResult(crate::workflow::execute_workflow_command(args))
+        }
+        "jobs" => CommandResult::OpenJobsPanel,
+        "bg" => execute_bg(args),
+        "kill" => execute_kill(args),
         _ => CommandResult::Unknown(name.to_string()),
     }
 }
@@ -229,6 +287,10 @@ fn execute_export(args: &str) -> CommandResult {
     };
 
     match format {
+        "block" => {
+            let index = rest.trim().parse::<usize>().ok();
+            return CommandResult::ExportBlock { index };
+        }
         "html" | "json" | "share" => {
             let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
             let ext = match format {
@@ -364,6 +426,69 @@ fn execute_git(args: &str) -> CommandResult {
         other => CommandResult::ChatMessage(format!(
             "Unknown git subcommand: {other}\nType /git for available subcommands."
         )),
+    }
+}
+
+/// `/record <start [file]|stop|pause|resume>` — terminal recording control.
+fn execute_record(args: &str) -> CommandResult {
+    let (subcmd, sub_args) = match args.split_once(char::is_whitespace) {
+        Some((cmd, rest)) => (cmd, rest.trim()),
+        None => (args.trim(), ""),
+    };
+
+    match subcmd {
+        "start" => {
+            let filename = if sub_args.is_empty() {
+                None
+            } else {
+                Some(sub_args.to_string())
+            };
+            CommandResult::RecordStart { filename }
+        }
+        "stop" => CommandResult::RecordStop,
+        "pause" => CommandResult::RecordPause,
+        "resume" => CommandResult::RecordResume,
+        "" => {
+            let help = "\
+/record start [file]  Begin recording (asciinema v2 format)\n\
+/record stop          Stop and save recording\n\
+/record pause         Pause recording\n\
+/record resume        Resume recording";
+            CommandResult::ChatMessage(help.to_string())
+        }
+        other => CommandResult::ChatMessage(format!(
+            "Unknown record subcommand: {other}\nType /record for available subcommands."
+        )),
+    }
+}
+
+/// `/bg <command>` — run a command in the background.
+fn execute_bg(args: &str) -> CommandResult {
+    let command = args.trim();
+    if command.is_empty() {
+        return CommandResult::ChatMessage(
+            "Usage: /bg <command>\n\nRuns a shell command in the background.\n\
+             Use /jobs to view running jobs."
+                .to_string(),
+        );
+    }
+    CommandResult::RunBackground {
+        command: command.to_string(),
+    }
+}
+
+/// `/kill <job_id>` — kill a running background job.
+fn execute_kill(args: &str) -> CommandResult {
+    let id_str = args.trim();
+    // Accept "#3" or "3" format
+    let id_str = id_str.trim_start_matches('#');
+    match id_str.parse::<u32>() {
+        Ok(job_id) if job_id > 0 => CommandResult::KillJob { job_id },
+        _ => CommandResult::ChatMessage(
+            "Usage: /kill <job_id>\n\nKills a running background job.\n\
+             Use /jobs to see job IDs."
+                .to_string(),
+        ),
     }
 }
 
@@ -557,7 +682,7 @@ mod tests {
         assert_eq!(matches[0].name, "clear");
 
         let matches = complete_command("");
-        assert_eq!(matches.len(), 10); // all commands
+        assert_eq!(matches.len(), get_commands().len()); // all commands
     }
 
     #[test]
@@ -762,5 +887,53 @@ mod tests {
         let commands = get_commands();
         let names: Vec<&str> = commands.iter().map(|c| c.name).collect();
         assert!(names.contains(&"import"));
+    }
+
+    // ── Bookmarks and block export tests ────────────────────────────────
+
+    #[test]
+    fn test_execute_bookmarks() {
+        let result = execute_command("bookmarks", "", "");
+        assert!(matches!(result, CommandResult::ListBookmarks));
+    }
+
+    #[test]
+    fn test_execute_export_block_no_index() {
+        let result = execute_command("export", "block", "");
+        match result {
+            CommandResult::ExportBlock { index } => {
+                assert_eq!(index, None);
+            }
+            other => panic!("expected ExportBlock, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_execute_export_block_with_index() {
+        let result = execute_command("export", "block 3", "");
+        match result {
+            CommandResult::ExportBlock { index } => {
+                assert_eq!(index, Some(3));
+            }
+            other => panic!("expected ExportBlock, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_execute_export_block_invalid_index() {
+        let result = execute_command("export", "block abc", "");
+        match result {
+            CommandResult::ExportBlock { index } => {
+                assert_eq!(index, None); // Non-numeric falls back to None
+            }
+            other => panic!("expected ExportBlock, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_get_commands_has_bookmarks() {
+        let commands = get_commands();
+        let names: Vec<&str> = commands.iter().map(|c| c.name).collect();
+        assert!(names.contains(&"bookmarks"));
     }
 }

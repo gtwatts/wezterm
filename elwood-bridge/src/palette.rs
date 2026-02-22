@@ -424,9 +424,16 @@ fn default_entries() -> Vec<PaletteEntry> {
             command: "toggle_mode".to_string(),
         },
         PaletteEntry {
+            name: "Fuzzy Finder".to_string(),
+            description: "Search files, commands, history".to_string(),
+            shortcut: Some("Ctrl+F".to_string()),
+            category: ActionCategory::Tool,
+            command: "fuzzy_finder".to_string(),
+        },
+        PaletteEntry {
             name: "Quick Fix".to_string(),
             description: "Fix last error".to_string(),
-            shortcut: Some("Ctrl+F".to_string()),
+            shortcut: None,
             category: ActionCategory::Tool,
             command: "quick_fix".to_string(),
         },

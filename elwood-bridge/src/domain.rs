@@ -193,6 +193,65 @@ async fn agent_runtime_loop(
                                 let _ = tx.send(response);
                             });
                         }
+                        AgentRequest::WorkflowRun { name, steps } => {
+                            // Workflows work without an LLM provider
+                            let tx = response_tx.clone();
+                            tokio::spawn(async move {
+                                let shell = std::env::var("SHELL")
+                                    .unwrap_or_else(|_| "bash".to_string());
+                                let total = steps.len();
+                                for (i, (command, description, continue_on_error)) in
+                                    steps.iter().enumerate()
+                                {
+                                    let mut cmd = tokio::process::Command::new(&shell);
+                                    cmd.arg("-c").arg(command);
+                                    cmd.stdout(std::process::Stdio::piped());
+                                    cmd.stderr(std::process::Stdio::piped());
+
+                                    let timeout = std::time::Duration::from_secs(300);
+                                    let result =
+                                        tokio::time::timeout(timeout, cmd.output()).await;
+
+                                    let (stdout, stderr, exit_code) = match result {
+                                        Ok(Ok(o)) => (
+                                            String::from_utf8_lossy(&o.stdout).to_string(),
+                                            String::from_utf8_lossy(&o.stderr).to_string(),
+                                            o.status.code(),
+                                        ),
+                                        Ok(Err(e)) => (
+                                            String::new(),
+                                            format!("Failed to execute: {e}"),
+                                            Some(-1),
+                                        ),
+                                        Err(_) => (
+                                            String::new(),
+                                            "Command timed out (5 minute limit)".to_string(),
+                                            Some(-1),
+                                        ),
+                                    };
+
+                                    let failed = exit_code.unwrap_or(1) != 0;
+                                    let is_last =
+                                        i + 1 == total || (failed && !continue_on_error);
+
+                                    let _ = tx.send(AgentResponse::WorkflowStepResult {
+                                        workflow_name: name.clone(),
+                                        step_index: i,
+                                        total_steps: total,
+                                        command: command.clone(),
+                                        description: description.clone(),
+                                        stdout,
+                                        stderr,
+                                        exit_code,
+                                        is_last,
+                                    });
+
+                                    if failed && !continue_on_error {
+                                        break;
+                                    }
+                                }
+                            });
+                        }
                         _ => {}
                     }
                 }
@@ -473,6 +532,59 @@ async fn agent_runtime_loop(
                 }
             }
 
+            AgentRequest::WorkflowRun { name, steps } => {
+                tracing::info!("Running workflow: {name} ({} steps)", steps.len());
+                let shell = std::env::var("SHELL").unwrap_or_else(|_| "bash".to_string());
+                let total = steps.len();
+
+                for (i, (command, description, continue_on_error)) in steps.iter().enumerate() {
+                    let mut cmd = tokio::process::Command::new(&shell);
+                    cmd.arg("-c").arg(command);
+                    cmd.stdout(std::process::Stdio::piped());
+                    cmd.stderr(std::process::Stdio::piped());
+
+                    let timeout = std::time::Duration::from_secs(300);
+                    let result = tokio::time::timeout(timeout, cmd.output()).await;
+
+                    let (stdout, stderr, exit_code) = match result {
+                        Ok(Ok(o)) => (
+                            String::from_utf8_lossy(&o.stdout).to_string(),
+                            String::from_utf8_lossy(&o.stderr).to_string(),
+                            o.status.code(),
+                        ),
+                        Ok(Err(e)) => (
+                            String::new(),
+                            format!("Failed to execute: {e}"),
+                            Some(-1),
+                        ),
+                        Err(_) => (
+                            String::new(),
+                            "Command timed out (5 minute limit)".to_string(),
+                            Some(-1),
+                        ),
+                    };
+
+                    let failed = exit_code.unwrap_or(1) != 0;
+                    let is_last = i + 1 == total || (failed && !continue_on_error);
+
+                    let _ = response_tx.send(AgentResponse::WorkflowStepResult {
+                        workflow_name: name.clone(),
+                        step_index: i,
+                        total_steps: total,
+                        command: command.clone(),
+                        description: description.clone(),
+                        stdout,
+                        stderr,
+                        exit_code,
+                        is_last,
+                    });
+
+                    if failed && !continue_on_error {
+                        break;
+                    }
+                }
+            }
+
             AgentRequest::Shutdown => {
                 tracing::info!("Elwood agent runtime shutting down");
                 cancel.cancel();
@@ -480,6 +592,138 @@ async fn agent_runtime_loop(
                 mcp_manager.shutdown_all().await;
                 let _ = response_tx.send(AgentResponse::Shutdown);
                 break;
+            }
+
+            AgentRequest::RunBackgroundCommand { command, working_dir } => {
+                tracing::info!("Starting background job: {command}");
+                let tx = response_tx.clone();
+                // Assign a temporary job_id from a simple counter.
+                // The pane-side JobManager assigns the real ID; we use a
+                // placeholder here and the pane maps it on receipt.
+                static BG_JOB_COUNTER: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(1);
+                let job_id = BG_JOB_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                tokio::spawn(async move {
+                    let shell = std::env::var("SHELL").unwrap_or_else(|_| "bash".to_string());
+                    let mut cmd = tokio::process::Command::new(&shell);
+                    cmd.arg("-c").arg(&command);
+                    cmd.stdout(std::process::Stdio::piped());
+                    cmd.stderr(std::process::Stdio::piped());
+                    if let Some(ref dir) = working_dir {
+                        cmd.current_dir(dir);
+                    }
+
+                    let child = cmd.spawn();
+                    match child {
+                        Ok(mut child) => {
+                            let pid = child.id();
+                            // Notify: job started with PID
+                            let _ = tx.send(AgentResponse::JobUpdate {
+                                job_id,
+                                status: "running".to_string(),
+                                output_chunk: Some(command.clone()),
+                                is_stderr: false,
+                                exit_code: None,
+                                pid,
+                            });
+
+                            // Stream stdout
+                            let stdout = child.stdout.take();
+                            let stderr = child.stderr.take();
+                            let tx_out = tx.clone();
+                            let tx_err = tx.clone();
+
+                            let stdout_handle = tokio::spawn(async move {
+                                if let Some(stdout) = stdout {
+                                    use tokio::io::{AsyncBufReadExt, BufReader};
+                                    let reader = BufReader::new(stdout);
+                                    let mut lines = reader.lines();
+                                    while let Ok(Some(line)) = lines.next_line().await {
+                                        let _ = tx_out.send(AgentResponse::JobUpdate {
+                                            job_id,
+                                            status: "running".to_string(),
+                                            output_chunk: Some(line),
+                                            is_stderr: false,
+                                            exit_code: None,
+                                            pid: None,
+                                        });
+                                    }
+                                }
+                            });
+
+                            let stderr_handle = tokio::spawn(async move {
+                                if let Some(stderr) = stderr {
+                                    use tokio::io::{AsyncBufReadExt, BufReader};
+                                    let reader = BufReader::new(stderr);
+                                    let mut lines = reader.lines();
+                                    while let Ok(Some(line)) = lines.next_line().await {
+                                        let _ = tx_err.send(AgentResponse::JobUpdate {
+                                            job_id,
+                                            status: "running".to_string(),
+                                            output_chunk: Some(line),
+                                            is_stderr: true,
+                                            exit_code: None,
+                                            pid: None,
+                                        });
+                                    }
+                                }
+                            });
+
+                            // Wait for process to complete
+                            let exit_status = child.wait().await;
+                            let _ = stdout_handle.await;
+                            let _ = stderr_handle.await;
+
+                            let (status, code) = match exit_status {
+                                Ok(s) => {
+                                    let c = s.code().unwrap_or(-1);
+                                    if c == 0 {
+                                        ("completed".to_string(), c)
+                                    } else {
+                                        ("failed".to_string(), c)
+                                    }
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(AgentResponse::JobUpdate {
+                                        job_id,
+                                        status: "running".to_string(),
+                                        output_chunk: Some(format!("Process error: {e}")),
+                                        is_stderr: true,
+                                        exit_code: None,
+                                        pid: None,
+                                    });
+                                    ("failed".to_string(), -1)
+                                }
+                            };
+
+                            let _ = tx.send(AgentResponse::JobUpdate {
+                                job_id,
+                                status,
+                                output_chunk: None,
+                                is_stderr: false,
+                                exit_code: Some(code),
+                                pid: None,
+                            });
+                        }
+                        Err(e) => {
+                            let _ = tx.send(AgentResponse::JobUpdate {
+                                job_id,
+                                status: "failed".to_string(),
+                                output_chunk: Some(format!("Failed to spawn: {e}")),
+                                is_stderr: true,
+                                exit_code: Some(-1),
+                                pid: None,
+                            });
+                        }
+                    }
+                });
+            }
+
+            AgentRequest::KillJob { job_id } => {
+                // Kill is handled on the pane side (it has the JobManager with PIDs).
+                // If it arrives here, log and ignore.
+                tracing::debug!("KillJob({job_id}) received in agent loop — handled on pane side");
             }
         }
     }
