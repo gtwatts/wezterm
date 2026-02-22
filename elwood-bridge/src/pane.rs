@@ -38,14 +38,22 @@ use crate::commands::{self, CommandResult};
 use crate::completions::CompletionEngine;
 use crate::context;
 use crate::diff;
+use crate::lua_api::{self, LuaEventArg, LuaEventDispatcher};
+use crate::file_browser::FileTree;
 use crate::semantic_bridge::SemanticBridge;
 use crate::diff_viewer::{DiffViewer, ReviewAction};
 use crate::editor::InputEditor;
 use crate::git_info;
+use crate::git_ui::{self, CommitView, StagingView};
 use crate::history_search::{HistoryRecord, HistorySearch};
 use crate::nl_classifier::NlClassifier;
-use crate::observer::{ContentDetector, ContentType, NextCommandSuggester};
+use crate::notification::{self, ToastAction, ToastLevel, ToastManager};
+use crate::observer::{ContentDetector, ContentType, NextCommandSuggester, PaneObserver};
 use crate::palette::CommandPalette;
+use crate::plan_mode;
+use crate::plan_viewer::PlanViewer;
+use crate::suggestion_overlay::SuggestionManager;
+use crate::prediction_engine::{PredictionContext, PredictionEngine};
 use crate::pty_inner::InnerPty;
 use crate::runtime::{AgentRequest, AgentResponse, InputMode, RuntimeBridge};
 use crate::screen::{self, ScreenState};
@@ -173,6 +181,24 @@ pub struct ElwoodPane {
     history_search: Mutex<HistorySearch>,
     /// Semantic bridge for code-aware completions and context.
     semantic_bridge: Mutex<Option<SemanticBridge>>,
+    /// Next-command prediction engine (rules + history bigrams + LLM).
+    prediction_engine: Mutex<PredictionEngine>,
+    /// Cross-pane observer for terminal awareness (reads sibling pane content).
+    pane_observer: PaneObserver,
+    /// File browser overlay (F2).
+    file_browser: Mutex<Option<FileTree>>,
+    /// Lua plugin event dispatcher for user-defined hooks.
+    lua_events: Mutex<Option<LuaEventDispatcher>>,
+    /// Suggestion overlay — shows error-fix suggestions from ContentDetector.
+    suggestion_manager: Mutex<SuggestionManager>,
+    /// Interactive git staging view (`/git stage`).
+    staging_view: Mutex<Option<StagingView>>,
+    /// Interactive git commit view (`/git commit`).
+    commit_view: Mutex<Option<CommitView>>,
+    /// Interactive plan viewer overlay. When `Some`, key events are routed here.
+    plan_viewer: Mutex<Option<PlanViewer>>,
+    /// Toast notification manager for proactive suggestions and status updates.
+    toast_manager: Mutex<ToastManager>,
 }
 
 /// A pending permission request waiting for user approval.
@@ -180,6 +206,33 @@ pub struct ElwoodPane {
 struct PendingPermission {
     request_id: String,
     tool_name: String,
+}
+
+/// Generate a simple conventional commit message from staged file statuses.
+fn generate_simple_commit_message(files: &[git_ui::GitFileStatus]) -> String {
+    let staged: Vec<_> = files.iter().filter(|f| f.staged).collect();
+    if staged.is_empty() { return String::new(); }
+    let (mut added, mut modified, mut deleted) = (0usize, 0usize, 0usize);
+    for f in &staged {
+        match f.status {
+            git_ui::FileStatus::Added | git_ui::FileStatus::Untracked => added += 1,
+            git_ui::FileStatus::Modified | git_ui::FileStatus::Renamed | git_ui::FileStatus::Copied => modified += 1,
+            git_ui::FileStatus::Deleted => deleted += 1,
+        }
+    }
+    let verb = if added >= modified && added >= deleted { "add" } else if deleted >= modified { "remove" } else { "update" };
+    if staged.len() == 1 {
+        let name = staged[0].path.rsplit('/').next().unwrap_or(&staged[0].path);
+        format!("{verb}: {name}")
+    } else {
+        let first_dir = staged[0].path.split('/').next().unwrap_or("");
+        let all_same_dir = staged.iter().all(|f| f.path.starts_with(first_dir));
+        if all_same_dir && !first_dir.is_empty() && first_dir != staged[0].path {
+            format!("{verb}: {} files in {first_dir}/", staged.len())
+        } else {
+            format!("{verb}: {} files", staged.len())
+        }
+    }
 }
 
 impl ElwoodPane {
@@ -242,7 +295,21 @@ impl ElwoodPane {
                 bridge.initialize();
                 Mutex::new(Some(bridge))
             },
+            prediction_engine: Mutex::new(PredictionEngine::new()),
+            pane_observer: PaneObserver::new(pane_id),
+            file_browser: Mutex::new(None),
+            lua_events: Mutex::new(LuaEventDispatcher::try_new()),
+            suggestion_manager: Mutex::new(SuggestionManager::new()),
+            staging_view: Mutex::new(None),
+            commit_view: Mutex::new(None),
+            plan_viewer: Mutex::new(None),
+            toast_manager: Mutex::new(ToastManager::new()),
         };
+
+        // Start observing sibling panes for cross-pane awareness.
+        // subscribe_all() watches all panes (empty subscription = observe everything).
+        pane.pane_observer.subscribe_all();
+        pane.pane_observer.start_observing();
 
         // Render the full-screen TUI layout (includes welcome message)
         {
@@ -259,6 +326,20 @@ impl ElwoodPane {
         let actions = termwiz::escape::parser::Parser::new().parse_as_vec(text.as_bytes());
         terminal.perform_actions(actions);
         self.seqno.fetch_add(1, Ordering::Release);
+    }
+
+    /// Render the toast notification overlay if any toasts are visible.
+    fn render_toasts(&self) {
+        let tm = self.toast_manager.lock();
+        if !tm.has_visible() {
+            return;
+        }
+        let toasts = tm.visible_toasts();
+        let ss = self.screen.lock();
+        let overlay = notification::render_toast_overlay(toasts, ss.width, ss.chat_top());
+        drop(ss);
+        drop(tm);
+        self.write_ansi(&overlay);
     }
 
     /// Redraw the fixed chrome (header, input box, status bar) without
@@ -368,6 +449,18 @@ impl ElwoodPane {
                             ss.task_start = None;
                             // Close the current agent block (exit 0 — successful turn)
                             self.block_manager.lock().finish_block(Some(0));
+                            // Toast: agent turn completed
+                            if let Some(elapsed) = ss.task_elapsed_frozen {
+                                if elapsed >= 5 {
+                                    self.toast_manager.lock().push(
+                                        "Agent turn complete",
+                                        ToastLevel::Success,
+                                        None,
+                                        None,
+                                    );
+                                    self.render_toasts();
+                                }
+                            }
                         }
                         AgentResponse::CommandOutput {
                             command,
@@ -422,6 +515,48 @@ impl ElwoodPane {
                                 }
                             });
 
+                            // Record command in prediction engine for bigram tracking
+                            self.prediction_engine.lock().record_command(command, code);
+
+                            // Populate suggestion overlay with structured detections
+                            let error_detections = self.detector.detect_errors(&lines);
+                            {
+                                let mut sm = self.suggestion_manager.lock();
+                                sm.clear();
+                                if !error_detections.is_empty() {
+                                    sm.add_batch(&error_detections);
+                                }
+                            }
+
+                            // Toast: errors in output or long-running success
+                            if !error_detections.is_empty() {
+                                let first_msg: String =
+                                    error_detections[0].message.chars().take(40).collect();
+                                self.toast_manager.lock().push_with_detail(
+                                    format!("Error in `{}`", truncate_cmd(command, 20)),
+                                    first_msg,
+                                    ToastLevel::Error,
+                                    None,
+                                    Some(ToastAction::SendToAgent(format!(
+                                        "Fix the error from `{command}`"
+                                    ))),
+                                );
+                                self.render_toasts();
+                            } else if success {
+                                let task_elapsed = self.screen.lock().task_elapsed_frozen;
+                                if let Some(secs) = task_elapsed {
+                                    if secs >= 5 {
+                                        self.toast_manager.lock().push(
+                                            format!("Command finished ({secs}s)"),
+                                            ToastLevel::Info,
+                                            None,
+                                            None,
+                                        );
+                                        self.render_toasts();
+                                    }
+                                }
+                            }
+
                             // Render Active AI suggestion if errors detected
                             if let Some(d) = primary {
                                 let label = match d.content_type {
@@ -432,9 +567,50 @@ impl ElwoodPane {
                                     ContentType::Unknown => "Error",
                                 };
                                 self.write_ansi(&screen::format_suggestion(label));
+
+                                // Render the structured suggestion overlay
+                                let sm = self.suggestion_manager.lock();
+                                if let Some(active) = sm.active() {
+                                    let ss = self.screen.lock();
+                                    let overlay = screen::render_suggestion_overlay(
+                                        &ss,
+                                        active,
+                                        sm.visible_count(),
+                                    );
+                                    drop(ss);
+                                    drop(sm);
+                                    self.write_ansi(&overlay);
+                                }
                             } else if let Some(suggestion) = self.suggester.suggest(command, success) {
                                 // No errors but there is a next-command suggestion
                                 self.write_ansi(&screen::format_next_command_suggestion(suggestion));
+                            }
+
+                            // Set prediction as ghost text in Terminal mode
+                            if self.input_editor.lock().mode() == InputMode::Terminal {
+                                let cwd = std::env::current_dir()
+                                    .unwrap_or_else(|_| PathBuf::from("."));
+                                let git_branch = self.screen.lock().git_info
+                                    .as_ref()
+                                    .map(|gi| gi.branch.clone());
+                                let recent: Vec<String> = self.completion_engine.lock()
+                                    .ghost_text("", &cwd)
+                                    .into_iter()
+                                    .collect();
+                                let pred_ctx = PredictionContext {
+                                    last_command: command.clone(),
+                                    last_exit_code: code,
+                                    working_dir: cwd,
+                                    git_branch,
+                                    recent_commands: recent,
+                                };
+                                if let Some(prediction) = self.prediction_engine.lock().predict(&pred_ctx) {
+                                    self.input_editor.lock().set_ghost_text(
+                                        Some(prediction.command),
+                                    );
+                                    self.sync_editor_to_screen();
+                                    self.refresh_input_box();
+                                }
                             }
                         }
                         AgentResponse::FileEdit {
@@ -470,16 +646,78 @@ impl ElwoodPane {
                                 .map(|s| s.elapsed().as_secs());
                             ss.task_start = None;
                         }
-                        AgentResponse::Error(_) => {
+                        AgentResponse::Error(ref msg) => {
                             *self.state.lock() = PaneState::Idle;
                             let mut ss = self.screen.lock();
                             ss.is_running = false;
                             ss.awaiting_permission = false;
                             ss.active_tool = None;
                             ss.tool_start = None;
+                            drop(ss);
+                            // Toast: agent error
+                            self.toast_manager.lock().push(
+                                msg.chars().take(50).collect::<String>(),
+                                ToastLevel::Error,
+                                None,
+                                None,
+                            );
+                            self.render_toasts();
                         }
                         AgentResponse::PtyScreenSnapshot { .. } => {
                             // PTY screen snapshots are handled by the PTY pane, not here
+                        }
+                        AgentResponse::PaneSnapshots { .. } => {
+                            // Pane snapshots are handled by the observer, not here
+                        }
+                        AgentResponse::ModelSwitched { ref model_name } => {
+                            let mut ss = self.screen.lock();
+                            ss.model_name = model_name.clone();
+                        }
+                        AgentResponse::PlanGenerated { ref plan_markdown } => {
+                            *self.state.lock() = PaneState::Idle;
+                            let mut ss = self.screen.lock();
+                            ss.is_running = false;
+                            ss.active_tool = None;
+                            ss.tool_start = None;
+                            ss.task_elapsed_frozen = ss.task_start
+                                .map(|s| s.elapsed().as_secs());
+                            ss.task_start = None;
+                            let width = ss.width as usize;
+                            drop(ss);
+
+                            // Parse the plan markdown into a structured plan
+                            let plan = plan_mode::parse_llm_plan(plan_markdown);
+
+                            // Save the plan to disk
+                            match plan_mode::save_plan(&plan) {
+                                Ok(path) => {
+                                    tracing::info!("Plan saved to {}", path.display());
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Failed to save plan: {e}");
+                                }
+                            }
+
+                            // Render the inline preview first
+                            let inline = plan_mode::render_plan_inline(&plan, width);
+                            self.write_ansi(&inline);
+
+                            // Open the plan viewer overlay for approval
+                            let viewer = PlanViewer::new(plan);
+                            let rendered = viewer.render(self.screen.lock().width);
+                            *self.plan_viewer.lock() = Some(viewer);
+                            self.write_ansi(&rendered);
+                        }
+                        AgentResponse::CostUpdate {
+                            input_tokens,
+                            output_tokens,
+                            cost_usd,
+                        } => {
+                            let mut ss = self.screen.lock();
+                            ss.tokens_used = ss.tokens_used.saturating_add(
+                                *input_tokens as usize + *output_tokens as usize,
+                            );
+                            ss.cost += cost_usd;
                         }
                         AgentResponse::Shutdown => {
                             *self.dead.lock() = true;
@@ -526,6 +764,9 @@ impl ElwoodPane {
                         _ => {}
                     }
 
+                    // ── Lua plugin hooks ──────────────────────────────
+                    self.dispatch_lua_event(&response);
+
                     // Render content into the scroll region
                     let text = format_response_for_chat(&response);
                     if !text.is_empty() {
@@ -556,6 +797,142 @@ impl ElwoodPane {
                     self.handle_pty_exit();
                 }
             }
+        }
+    }
+
+    /// Dispatch a Lua plugin event for the given agent response.
+    ///
+    /// All Lua calls happen inside the `lua_events` lock. Side effects
+    /// (rendering notifications, updating state, sending bridge requests)
+    /// happen *after* the lock is released to avoid nested-lock deadlocks.
+    fn dispatch_lua_event(&self, response: &AgentResponse) {
+        let pid = self.pane_id as u64;
+
+        // Collect the active tool name outside the lua lock if needed.
+        let active_tool = match response {
+            AgentResponse::ToolEnd { .. } => {
+                self.screen.lock().active_tool.clone().unwrap_or_default()
+            }
+            _ => String::new(),
+        };
+
+        // Hold the lua lock only for dispatching; collect results into locals.
+        let (notifications, approve_tool, approve_permission) = {
+            let guard = self.lua_events.lock();
+            let lua = match guard.as_ref() {
+                Some(l) => l,
+                None => return,
+            };
+
+            match response {
+                AgentResponse::ContentDelta(text) => {
+                    let n = lua.dispatch(
+                        lua_api::EVENT_AGENT_MESSAGE,
+                        pid,
+                        &[LuaEventArg::Str(text.clone())],
+                    );
+                    (n, None, None)
+                }
+                AgentResponse::ToolStart { tool_name, input_preview, .. } => {
+                    let (r, n) = lua.dispatch_with_result(
+                        lua_api::EVENT_TOOL_START,
+                        pid,
+                        &[
+                            LuaEventArg::Str(tool_name.clone()),
+                            LuaEventArg::Str(input_preview.clone()),
+                        ],
+                    );
+                    let approved = if r.approve == Some(true) {
+                        Some(tool_name.clone())
+                    } else {
+                        None
+                    };
+                    (n, approved, None)
+                }
+                AgentResponse::ToolEnd { success, output_preview, .. } => {
+                    let n = lua.dispatch(
+                        lua_api::EVENT_TOOL_END,
+                        pid,
+                        &[
+                            LuaEventArg::Str(active_tool),
+                            LuaEventArg::Bool(*success),
+                            LuaEventArg::Str(output_preview.clone()),
+                        ],
+                    );
+                    (n, None, None)
+                }
+                AgentResponse::CommandOutput { command, exit_code, .. } => {
+                    let n = lua.dispatch(
+                        lua_api::EVENT_COMMAND_COMPLETE,
+                        pid,
+                        &[
+                            LuaEventArg::Str(command.clone()),
+                            LuaEventArg::OptInt(exit_code.map(|c| c as i64)),
+                        ],
+                    );
+                    (n, None, None)
+                }
+                AgentResponse::PermissionRequest { request_id, tool_name, description } => {
+                    let (r, n) = lua.dispatch_with_result(
+                        lua_api::EVENT_PERMISSION_REQUEST,
+                        pid,
+                        &[
+                            LuaEventArg::Str(tool_name.clone()),
+                            LuaEventArg::Str(description.clone()),
+                        ],
+                    );
+                    let approved = if r.approve == Some(true) {
+                        Some((request_id.clone(), tool_name.clone()))
+                    } else {
+                        None
+                    };
+                    (n, None, approved)
+                }
+                AgentResponse::Error(msg) => {
+                    let n = lua.dispatch(
+                        lua_api::EVENT_ERROR_DETECTED,
+                        pid,
+                        &[
+                            LuaEventArg::Str("agent_error".into()),
+                            LuaEventArg::Str(msg.clone()),
+                        ],
+                    );
+                    (n, None, None)
+                }
+                _ => return,
+            }
+        };
+        // lua_events lock is dropped here
+
+        // Side effects: render notifications
+        self.render_lua_notifications(&notifications);
+
+        // Log auto-approved tool starts
+        if let Some(tool_name) = approve_tool {
+            log::debug!("Lua hook auto-approved tool_start for {tool_name}");
+        }
+
+        // Auto-approve permission requests from Lua hooks
+        if let Some((request_id, tool_name)) = approve_permission {
+            log::info!("Lua hook auto-approved permission for {tool_name}");
+            let _ = self.bridge.send_request(AgentRequest::PermissionResponse {
+                request_id,
+                granted: true,
+            });
+            *self.state.lock() = PaneState::Running;
+            {
+                let mut ss = self.screen.lock();
+                ss.awaiting_permission = false;
+                ss.is_running = true;
+            }
+            *self.pending_permission.lock() = None;
+        }
+    }
+
+    /// Render notifications from Lua hooks into the chat area.
+    fn render_lua_notifications(&self, notifications: &[String]) {
+        for notification in notifications {
+            self.write_ansi(&format!("\r\n\x1b[38;2;125;207;255m  [hook] {notification}\x1b[0m\r\n"));
         }
     }
 
@@ -651,9 +1028,28 @@ impl ElwoodPane {
         }
 
         // Sync to screen state and refresh chrome
+        let (old_str, new_str) = match new_mode {
+            InputMode::Agent => ("Terminal", "Agent"),
+            InputMode::Terminal => ("Agent", "Terminal"),
+        };
         let mut ss = self.screen.lock();
         ss.input_mode = new_mode;
         drop(ss);
+
+        // Dispatch mode_change Lua hook
+        let mode_notifs = {
+            let guard = self.lua_events.lock();
+            match guard.as_ref() {
+                Some(lua) => lua.dispatch(
+                    lua_api::EVENT_MODE_CHANGE,
+                    self.pane_id as u64,
+                    &[LuaEventArg::Str(old_str.into()), LuaEventArg::Str(new_str.into())],
+                ),
+                None => Vec::new(),
+            }
+        };
+        self.render_lua_notifications(&mode_notifs);
+
         self.refresh_input_box();
         self.refresh_status_bar();
     }
@@ -752,9 +1148,19 @@ impl ElwoodPane {
         *self.state.lock() = PaneState::Running;
         self.refresh_status_bar();
 
-        // Send to agent via bridge (use augmented content with file context)
+        // ── Cross-pane context injection ────────────────────────────
+        // Include recent content from sibling panes so the agent has
+        // awareness of what's happening in other terminal tabs/splits.
+        let pane_context = self.pane_observer.format_context_for_agent(50);
+        let final_content = if pane_context.is_empty() {
+            augmented_content
+        } else {
+            format!("{pane_context}\n{augmented_content}")
+        };
+
+        // Send to agent via bridge (use augmented content with file + pane context)
         let _ = self.bridge.send_request(AgentRequest::SendMessage {
-            content: augmented_content,
+            content: final_content,
         });
     }
 
@@ -792,6 +1198,37 @@ impl ElwoodPane {
             CommandResult::OpenDiffViewer { staged } => {
                 self.open_git_diff_viewer(staged);
             }
+            CommandResult::GitStatus => {
+                self.handle_git_status();
+            }
+            CommandResult::OpenStagingView => {
+                self.open_staging_view();
+            }
+            CommandResult::OpenCommitFlow => {
+                self.open_commit_flow();
+            }
+            CommandResult::GitPush => {
+                self.handle_git_push();
+            }
+            CommandResult::GitLog { count } => {
+                self.handle_git_log(count);
+            }
+            CommandResult::ListPanes => {
+                self.handle_list_panes();
+            }
+            CommandResult::ListPlans => {
+                self.handle_list_plans();
+            }
+            CommandResult::ResumePlan { id_prefix } => {
+                self.handle_resume_plan(&id_prefix);
+            }
+            CommandResult::SwitchModel { model_name } => {
+                let _ = self.bridge.send_request(AgentRequest::SwitchModel {
+                    model_name,
+                });
+            }
+            CommandResult::ExportFormatted { path, format } => { self.write_ansi(&screen::format_command_response(&format!("Export as {format} to: {path}"))); }
+            CommandResult::ImportSession { path } => { self.write_ansi(&screen::format_command_response(&format!("Import session from: {path}"))); }
             CommandResult::Unknown(name) => {
                 self.write_ansi(&screen::format_command_response(&format!(
                     "Unknown command: /{name}\nType /help for available commands."
@@ -843,6 +1280,57 @@ impl ElwoodPane {
                 ));
             }
         }
+    }
+
+    /// Handle the `/panes` command — list sibling terminal panes with previews.
+    fn handle_list_panes(&self) {
+        let panes = PaneObserver::list_panes();
+        let own_id = self.pane_id;
+
+        if panes.len() <= 1 {
+            self.write_ansi(&screen::format_command_response(
+                "No sibling panes found. Split the terminal to see other panes.",
+            ));
+            return;
+        }
+
+        let mut msg = String::from("Sibling terminal panes:\n\n");
+        for info in &panes {
+            if info.pane_id == own_id {
+                continue;
+            }
+            let process = info
+                .foreground_process
+                .as_deref()
+                .unwrap_or("(unknown)");
+            let cwd_str = info.cwd.as_deref().unwrap_or("");
+            let status = if info.is_dead { " [dead]" } else { "" };
+            msg.push_str(&format!(
+                "  Pane {} | {}x{} | {} | {}{}\n",
+                info.pane_id, info.cols, info.rows, process, cwd_str, status,
+            ));
+
+            if let Some(snap) = self.pane_observer.get_pane_content(info.pane_id) {
+                let start = snap.lines.len().saturating_sub(5);
+                for line in &snap.lines[start..] {
+                    let trimmed = line.trim_end();
+                    if !trimmed.is_empty() {
+                        msg.push_str(&format!("    | {trimmed}\n"));
+                    }
+                }
+                msg.push('\n');
+            }
+        }
+
+        let errors = self.pane_observer.detect_errors_in_siblings();
+        if !errors.is_empty() {
+            msg.push_str("Detected errors:\n");
+            for (pane_id, summary) in &errors {
+                msg.push_str(&format!("  [Pane {pane_id}] {summary}\n"));
+            }
+        }
+
+        self.write_ansi(&screen::format_command_response(&msg));
     }
 
     /// Sync the InputEditor's current state into ScreenState for rendering.
@@ -936,6 +1424,78 @@ impl ElwoodPane {
         drop(hs);
         if !rendered.is_empty() {
             self.write_ansi(&rendered);
+        }
+    }
+
+    // ── File browser (F2) ───────────────────────────────────────────────────
+    fn toggle_file_browser(&self) {
+        let mut fb = self.file_browser.lock();
+        if fb.is_some() { *fb = None; } else {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            *fb = Some(FileTree::new(cwd));
+            drop(fb); self.render_file_browser_overlay();
+        }
+    }
+    fn render_file_browser_overlay(&self) {
+        let mut fb = self.file_browser.lock();
+        if let Some(ref mut tree) = *fb {
+            let ss = self.screen.lock();
+            let rendered = tree.render(ss.width, ss.height);
+            drop(ss); drop(fb); self.write_ansi(&rendered);
+        }
+    }
+    fn handle_file_browser_key(&self, key: KeyCode, mods: KeyModifiers) {
+        let filter_active = self.file_browser.lock().as_ref().map(|t| t.filter_active).unwrap_or(false);
+        if filter_active {
+            match key {
+                KeyCode::Escape => { if let Some(ref mut t) = *self.file_browser.lock() { t.filter_active = false; t.filter_clear(); } self.render_file_browser_overlay(); }
+                KeyCode::Enter => { if let Some(ref mut t) = *self.file_browser.lock() { t.filter_active = false; } self.render_file_browser_overlay(); }
+                KeyCode::Backspace => { if let Some(ref mut t) = *self.file_browser.lock() { t.filter_backspace(); } self.render_file_browser_overlay(); }
+                KeyCode::Char(c) if mods.is_empty() || mods == KeyModifiers::SHIFT => { if let Some(ref mut t) = *self.file_browser.lock() { t.filter_insert_char(c); } self.render_file_browser_overlay(); }
+                _ => {}
+            }
+            return;
+        }
+        match key {
+            KeyCode::Escape | KeyCode::Char('q') | KeyCode::Function(2) => { *self.file_browser.lock() = None; }
+            KeyCode::UpArrow | KeyCode::Char('k') if mods.is_empty() => { if let Some(ref mut t) = *self.file_browser.lock() { t.move_up(); } self.render_file_browser_overlay(); }
+            KeyCode::DownArrow | KeyCode::Char('j') if mods.is_empty() => { if let Some(ref mut t) = *self.file_browser.lock() { t.move_down(); } self.render_file_browser_overlay(); }
+            KeyCode::Enter if mods.is_empty() => { self.file_browser_action_open(); }
+            KeyCode::Char(' ') if mods.is_empty() => {
+                if let Some(ref mut t) = *self.file_browser.lock() {
+                    let is_dir = t.selected_entry().map(|e| e.entry_type == crate::file_browser::EntryType::Directory).unwrap_or(false);
+                    if is_dir { t.toggle_expand(); } else { t.show_preview = !t.show_preview; }
+                }
+                self.render_file_browser_overlay();
+            }
+            KeyCode::Char('@') if mods.is_empty() || mods == KeyModifiers::SHIFT => { self.file_browser_action_attach(); }
+            KeyCode::Char('/') if mods.is_empty() => { if let Some(ref mut t) = *self.file_browser.lock() { t.filter_active = true; } self.render_file_browser_overlay(); }
+            _ => {}
+        }
+    }
+    fn file_browser_action_open(&self) {
+        let info = { let mut fb = self.file_browser.lock(); fb.as_mut().and_then(|tree| { let entry = tree.selected_entry()?; let et = entry.entry_type; let p = entry.path.clone(); if et == crate::file_browser::EntryType::Directory { tree.toggle_expand(); None } else { Some(p) } }) };
+        if info.is_none() { self.render_file_browser_overlay(); return; }
+        let path = info.unwrap();
+        *self.file_browser.lock() = None;
+        let editor_cmd = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+        let command = format!("{editor_cmd} {}", path.display());
+        self.write_ansi(&screen::format_command_prompt(&command));
+        let working_dir = std::env::current_dir().ok().map(|p| p.to_string_lossy().to_string());
+        let _ = self.bridge.send_request(AgentRequest::RunCommand { command, working_dir });
+    }
+    fn file_browser_action_attach(&self) {
+        let path = self.file_browser.lock().as_ref().and_then(|tree| { tree.selected_entry().filter(|e| e.entry_type == crate::file_browser::EntryType::File).map(|e| e.path.clone()) });
+        if let Some(path) = path {
+            *self.file_browser.lock() = None;
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let rel = path.strip_prefix(&cwd).unwrap_or(&path).to_string_lossy().to_string();
+            let at_ref = format!("@{rel} ");
+            { let mut ed = self.input_editor.lock(); for c in at_ref.chars() { ed.insert_char(c); } }
+            self.sync_editor_to_screen(); self.refresh_input_box();
+            self.write_ansi(&format!("
+[38;2;86;95;137m[2m[Attached: @{rel}][0m
+"));
         }
     }
 
@@ -1170,6 +1730,177 @@ impl ElwoodPane {
         }
     }
 
+    // ── Git UI overlay handlers (staging view, commit view) ────────────
+
+    fn handle_git_status(&self) {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        match git_ui::format_git_status(&cwd) {
+            Ok(o) => self.write_ansi(&format!("\r\n{o}")),
+            Err(e) => self.write_ansi(&screen::format_error(&format!("git status failed: {e}"))),
+        }
+    }
+
+    fn handle_git_log(&self, count: usize) {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        match git_ui::format_git_log(&cwd, count) {
+            Ok(o) => self.write_ansi(&format!("\r\n{o}")),
+            Err(e) => self.write_ansi(&screen::format_error(&format!("git log failed: {e}"))),
+        }
+    }
+
+    fn handle_git_push(&self) {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let r = git_ui::git_push(&cwd);
+        self.write_ansi(&git_ui::format_git_push_result(r));
+        self.screen.lock().git_info = git_info::get_git_info(&cwd);
+        self.refresh_status_bar();
+    }
+
+    fn open_staging_view(&self) {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        match StagingView::new(&cwd) {
+            Ok(v) => { let w = self.screen.lock().width as usize; let rendered = v.render(w); *self.staging_view.lock() = Some(v); self.write_ansi(&rendered); }
+            Err(e) => self.write_ansi(&screen::format_command_response(&e)),
+        }
+    }
+
+    fn open_commit_flow(&self) {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let files = match git_ui::get_file_statuses(&cwd) { Ok(f) => f, Err(e) => { self.write_ansi(&screen::format_error(&format!("git status: {e}"))); return; } };
+        let sc = files.iter().filter(|f| f.staged).count();
+        if sc == 0 { self.write_ansi(&screen::format_command_response("No files staged. Opening staging view...")); self.open_staging_view(); return; }
+        let msg = generate_simple_commit_message(&files);
+        let cv = CommitView::new(&cwd, msg, sc);
+        let w = self.screen.lock().width as usize;
+        let rendered = cv.render(w);
+        *self.commit_view.lock() = Some(cv);
+        self.write_ansi(&rendered);
+    }
+
+    fn handle_staging_view_key(&self, key: KeyCode, mods: KeyModifiers) {
+        let act = { let mut g = self.staging_view.lock(); let v = match g.as_mut() { Some(v) => v, None => return }; match key { KeyCode::Char(' ') if mods.is_empty() => { v.toggle_current(); None } KeyCode::Char('a') | KeyCode::Char('A') if mods.is_empty() => { v.toggle_all(); None } KeyCode::Char('j') | KeyCode::DownArrow if mods.is_empty() => { v.move_down(); None } KeyCode::Char('k') | KeyCode::UpArrow if mods.is_empty() => { v.move_up(); None } KeyCode::Enter if mods.is_empty() => Some(("ok", v.staged_paths().len())), KeyCode::Escape => Some(("esc", 0)), _ => None, } };
+        if let Some((a, n)) = act { *self.staging_view.lock() = None; if a == "ok" { self.write_ansi(&format!("\r\n\x1b[38;2;158;206;106m\x1b[1m{n} file{} staged\x1b[0m\r\n", if n == 1 { "" } else { "s" })); let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")); self.screen.lock().git_info = git_info::get_git_info(&cwd); self.refresh_status_bar(); } else { self.write_ansi("\r\n\x1b[38;2;86;95;137m\x1b[2m[Staging cancelled]\x1b[0m\r\n"); } }
+        else { let g = self.staging_view.lock(); if let Some(ref v) = *g { let w = self.screen.lock().width as usize; let rendered = v.render(w); drop(g); self.write_ansi(&rendered); } }
+    }
+
+    fn handle_commit_view_key(&self, key: KeyCode, mods: KeyModifiers) {
+        let act = { let mut g = self.commit_view.lock(); let v = match g.as_mut() { Some(v) => v, None => return }; if v.editing { match key { KeyCode::Escape => { v.editing = false; None } KeyCode::Enter if mods == KeyModifiers::SHIFT => { v.insert_newline(); None } KeyCode::Enter if mods.is_empty() => Some("commit"), KeyCode::Backspace => { v.backspace(); None } KeyCode::Char(c) if mods.is_empty() || mods == KeyModifiers::SHIFT => { v.insert_char(c); None } _ => None, } } else { match key { KeyCode::Enter if mods.is_empty() => Some("commit"), KeyCode::Char('e') | KeyCode::Char('E') if mods.is_empty() => { v.start_edit(); None } KeyCode::Escape => Some("cancel"), _ => None, } } };
+        if let Some(a) = act { if a == "commit" { let res = { self.commit_view.lock().as_ref().map(|v| v.commit()) }; *self.commit_view.lock() = None; match res { Some(Ok(out)) => { self.write_ansi(&format!("\r\n\x1b[38;2;158;206;106m\x1b[1mCommit successful\x1b[0m\r\n\x1b[38;2;192;202;245m{out}\x1b[0m\r\n")); let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")); self.screen.lock().git_info = git_info::get_git_info(&cwd); self.refresh_status_bar(); } Some(Err(e)) => self.write_ansi(&screen::format_error(&format!("Commit failed: {e}"))), None => {} } } else { *self.commit_view.lock() = None; self.write_ansi("\r\n\x1b[38;2;86;95;137m\x1b[2m[Commit cancelled]\x1b[0m\r\n"); } }
+        else { let g = self.commit_view.lock(); if let Some(ref v) = *g { let w = self.screen.lock().width as usize; let rendered = v.render(w); drop(g); self.write_ansi(&rendered); } }
+    }
+
+    // ── Plan mode ───────────────────────────────────────────────────────
+    fn handle_list_plans(&self) {
+        let plans = plan_mode::list_plans();
+        if plans.is_empty() {
+            self.write_ansi(&screen::format_command_response("No saved plans. Use /plan <description> to create one."));
+            return;
+        }
+        let mut msg = String::from("Saved plans:\n\n");
+        for (path, title, status) in &plans {
+            let id = path.file_stem().and_then(|n| n.to_str()).and_then(|n| n.get(..15)).unwrap_or("???");
+            msg.push_str(&format!("  {id}  [{status}]  {title}\n"));
+        }
+        msg.push_str("\nUse /plan resume <id-prefix> to resume a plan.");
+        self.write_ansi(&screen::format_command_response(&msg));
+    }
+
+    fn handle_resume_plan(&self, id_prefix: &str) {
+        let plans = plan_mode::list_plans();
+        let matching: Vec<_> = plans.iter().filter(|(path, _, _)| {
+            path.file_stem().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(id_prefix))
+        }).collect();
+        match matching.len() {
+            0 => { self.write_ansi(&screen::format_command_response(&format!("No plan found matching '{id_prefix}'."))); }
+            1 => {
+                let (path, _, _) = matching[0];
+                match plan_mode::load_plan(path) {
+                    Ok(plan) => {
+                        let viewer = PlanViewer::new(plan);
+                        let rendered = viewer.render(self.screen.lock().width);
+                        *self.plan_viewer.lock() = Some(viewer);
+                        self.write_ansi(&rendered);
+                    }
+                    Err(e) => { self.write_ansi(&screen::format_error(&format!("Failed to load plan: {e}"))); }
+                }
+            }
+            _ => {
+                let mut msg = format!("Multiple plans match '{id_prefix}'. Be more specific:\n\n");
+                for (path, title, status) in &matching {
+                    let id = path.file_stem().and_then(|n| n.to_str()).unwrap_or("???");
+                    msg.push_str(&format!("  {id}  [{status}]  {title}\n"));
+                }
+                self.write_ansi(&screen::format_command_response(&msg));
+            }
+        }
+    }
+
+    fn handle_plan_viewer_key(&self, key: KeyCode, mods: KeyModifiers) -> anyhow::Result<()> {
+        let action = {
+            let mut vg = self.plan_viewer.lock();
+            let viewer = match vg.as_mut() { Some(v) => v, None => return Ok(()) };
+            if viewer.editing {
+                match key {
+                    KeyCode::Enter if mods.is_empty() => viewer.submit_edit(),
+                    KeyCode::Escape => viewer.cancel_edit(),
+                    KeyCode::Backspace => viewer.edit_backspace(),
+                    KeyCode::Char(c) if mods.is_empty() || mods == KeyModifiers::SHIFT => viewer.edit_insert_char(c),
+                    _ => {}
+                }
+                let rendered = viewer.render(self.screen.lock().width);
+                drop(vg);
+                self.write_ansi(&rendered);
+                return Ok(());
+            }
+            match key {
+                KeyCode::Enter if mods.is_empty() => {
+                    viewer.plan.status = plan_mode::PlanStatus::Approved;
+                    let _ = plan_mode::save_plan(&viewer.plan);
+                    Some(crate::plan_viewer::PlanAction::Approve)
+                }
+                KeyCode::Char('q') | KeyCode::Escape => Some(crate::plan_viewer::PlanAction::Cancel),
+                KeyCode::Char('j') | KeyCode::DownArrow if mods.is_empty() => { viewer.move_down(); None }
+                KeyCode::Char('k') | KeyCode::UpArrow if mods.is_empty() => { viewer.move_up(); None }
+                KeyCode::Char(' ') if mods.is_empty() => { viewer.toggle_current(); None }
+                KeyCode::Char('e') if mods.is_empty() => { viewer.start_edit(); None }
+                _ => None,
+            }
+        };
+        if let Some(pa) = action {
+            match pa {
+                crate::plan_viewer::PlanAction::Approve => {
+                    let plan = { self.plan_viewer.lock().as_ref().map(|v| v.plan.clone()) };
+                    *self.plan_viewer.lock() = None;
+                    self.write_ansi("\r\n\x1b[38;2;158;206;106m\x1b[1m\u{2714} Plan approved\x1b[0m\r\n");
+                    if let Some(mut plan) = plan {
+                        plan.status = plan_mode::PlanStatus::InProgress;
+                        let _ = plan_mode::save_plan(&plan);
+                        if let Some(idx) = plan.next_step_index() {
+                            let prompt = format!("Execute step {} of the plan: {}", idx + 1, plan.steps[idx].description);
+                            self.write_ansi(&screen::format_assistant_prefix());
+                            { let mut ss = self.screen.lock(); ss.is_running = true; ss.task_start = Some(Instant::now()); ss.task_elapsed_frozen = None; }
+                            *self.state.lock() = PaneState::Running;
+                            self.refresh_status_bar();
+                            let _ = self.bridge.send_request(AgentRequest::SendMessage { content: prompt });
+                        }
+                    }
+                }
+                crate::plan_viewer::PlanAction::Cancel => {
+                    *self.plan_viewer.lock() = None;
+                    self.write_ansi("\r\n\x1b[38;2;86;95;137m\x1b[2m[Plan viewer closed]\x1b[0m\r\n");
+                }
+            }
+        } else {
+            let vg = self.plan_viewer.lock();
+            if let Some(ref v) = *vg {
+                let rendered = v.render(self.screen.lock().width);
+                drop(vg);
+                self.write_ansi(&rendered);
+            }
+        }
+        Ok(())
+    }
+
     /// Handle the PTY child process exit.
     ///
     /// Switches back to Agent mode, resets the SharedWriter to sink,
@@ -1320,8 +2051,26 @@ fn format_response_for_chat(response: &AgentResponse) -> String {
         AgentResponse::FileEdit { .. } => String::new(),
         // PtyScreenSnapshot is handled internally
         AgentResponse::PtyScreenSnapshot { .. } => String::new(),
+        // PaneSnapshots are handled by the observer
+        AgentResponse::PaneSnapshots { .. } => String::new(),
         AgentResponse::Error(msg) => screen::format_error(msg),
         AgentResponse::Shutdown => screen::format_shutdown(),
+        // Other response types handled by subsystems
+        _ => String::new(),
+    }
+}
+
+
+/// Truncate a command string for display in toast messages.
+fn truncate_cmd(cmd: &str, max: usize) -> String {
+    if cmd.len() <= max {
+        cmd.to_string()
+    } else {
+        let mut end = max;
+        while !cmd.is_char_boundary(end) && end > 0 {
+            end -= 1;
+        }
+        format!("{}...", &cmd[..end])
     }
 }
 
@@ -1489,7 +2238,110 @@ impl mux::pane::Pane for ElwoodPane {
             return self.handle_diff_viewer_key(key, mods);
         }
 
-        // ── Command palette mode: route all keys to palette ──────────
+        // ── Plan viewer mode: route keys to plan viewer ────────────
+        if self.plan_viewer.lock().is_some() {
+            return self.handle_plan_viewer_key(key, mods);
+        }
+
+        // ── File browser mode: route keys to file browser ────────────
+        if self.file_browser.lock().is_some() {
+            self.handle_file_browser_key(key, mods);
+            return Ok(());
+        }
+
+        // ── Git staging view: route keys to staging view ────────────
+        if self.staging_view.lock().is_some() {
+            self.handle_staging_view_key(key, mods);
+            return Ok(());
+        }
+
+        // ── Git commit view: route keys to commit view ──────────────
+        if self.commit_view.lock().is_some() {
+            self.handle_commit_view_key(key, mods);
+            return Ok(());
+        }
+
+        // ── Suggestion overlay mode: Enter/Esc/Tab ──────────────────
+        if self.suggestion_manager.lock().has_visible() {
+            match key {
+                KeyCode::Enter => {
+                    let fix = self.suggestion_manager.lock().accept();
+                    if let Some(fix_cmd) = fix {
+                        // Insert the fix command into the input editor
+                        let mut editor = self.input_editor.lock();
+                        editor.clear();
+                        for ch in fix_cmd.chars() {
+                            editor.insert_char(ch);
+                        }
+                        drop(editor);
+                        self.sync_editor_to_screen();
+                    }
+                    return Ok(());
+                }
+                KeyCode::Escape => {
+                    self.suggestion_manager.lock().dismiss();
+                    return Ok(());
+                }
+                KeyCode::Tab if mods.is_empty() => {
+                    self.suggestion_manager.lock().next();
+                    // Re-render the overlay with the new active suggestion
+                    let sm = self.suggestion_manager.lock();
+                    if let Some(active) = sm.active() {
+                        let ss = self.screen.lock();
+                        let overlay = screen::render_suggestion_overlay(
+                            &ss,
+                            active,
+                            sm.visible_count(),
+                        );
+                        drop(ss);
+                        drop(sm);
+                        self.write_ansi(&overlay);
+                    }
+                    return Ok(());
+                }
+                _ => {
+                    // Any other key dismisses the overlay and falls through
+                    self.suggestion_manager.lock().clear();
+                }
+            }
+        }
+
+        // ── Toast notification mode: Esc dismiss, Enter accept action ──
+        if self.toast_manager.lock().has_visible() {
+            match key {
+                KeyCode::Escape => {
+                    self.toast_manager.lock().dismiss_top();
+                    return Ok(());
+                }
+                KeyCode::Enter => {
+                    let action = self.toast_manager.lock().accept_top();
+                    if let Some(ToastAction::RunCommand(cmd)) = action {
+                        let mut editor = self.input_editor.lock();
+                        editor.clear();
+                        for ch in cmd.chars() {
+                            editor.insert_char(ch);
+                        }
+                        drop(editor);
+                        self.sync_editor_to_screen();
+                    } else if let Some(ToastAction::SendToAgent(msg)) = action {
+                        let mut editor = self.input_editor.lock();
+                        editor.clear();
+                        for ch in msg.chars() {
+                            editor.insert_char(ch);
+                        }
+                        drop(editor);
+                        self.sync_editor_to_screen();
+                    }
+                    return Ok(());
+                }
+                _ => {
+                    // Other keys dismiss toasts and fall through
+                    self.toast_manager.lock().clear();
+                }
+            }
+        }
+
+                // ── Command palette mode: route all keys to palette ──────────
         {
             let palette_open = self.palette.lock().is_open();
             if palette_open {
@@ -1571,6 +2423,12 @@ impl mux::pane::Pane for ElwoodPane {
                 }
                 return Ok(());
             }
+        }
+
+        // F2 toggles file browser
+        if key == KeyCode::Function(2) && mods.is_empty() {
+            self.toggle_file_browser();
+            return Ok(());
         }
 
         // Ctrl+P toggles command palette

@@ -642,6 +642,7 @@ mod tests {
         let mut mgr = McpClientManager::new();
         let config = McpConfig {
             client_enabled: false,
+            server_enabled: false,
             servers: HashMap::new(),
         };
         mgr.connect_all(&config).await;
@@ -653,6 +654,7 @@ mod tests {
         let mut mgr = McpClientManager::new();
         let config = McpConfig {
             client_enabled: true,
+            server_enabled: false,
             servers: HashMap::new(),
         };
         mgr.connect_all(&config).await;
@@ -664,6 +666,7 @@ mod tests {
         let mut mgr = McpClientManager::new();
         let config = McpConfig {
             client_enabled: true,
+            server_enabled: false,
             servers: HashMap::from([(
                 "bad".to_string(),
                 McpServerConfig {
@@ -685,6 +688,7 @@ mod tests {
         let mut mgr = McpClientManager::new();
         let config = McpConfig {
             client_enabled: true,
+            server_enabled: false,
             servers: HashMap::from([(
                 "remote".to_string(),
                 McpServerConfig {

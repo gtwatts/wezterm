@@ -57,7 +57,7 @@ pub fn read_pane(
             pane_id: input.pane_id,
             title: snap.title,
             lines: snap.lines,
-            viewport_rows: snap.viewport_rows,
+            viewport_rows: snap.dimensions.1,
         }),
         None => anyhow::bail!("Pane {} not found or not accessible", input.pane_id),
     }

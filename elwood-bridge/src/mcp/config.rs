@@ -9,11 +9,15 @@ use std::collections::HashMap;
 /// Top-level MCP configuration block.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpConfig {
-    /// Whether the MCP client is enabled.
+    /// Whether the MCP client is enabled (consuming external servers).
     #[serde(default = "default_true")]
     pub client_enabled: bool,
 
-    /// Configured MCP servers to connect to.
+    /// Whether the MCP server is enabled (exposing terminal capabilities).
+    #[serde(default)]
+    pub server_enabled: bool,
+
+    /// Configured MCP servers to connect to (client side).
     #[serde(default)]
     pub servers: HashMap<String, McpServerConfig>,
 }
@@ -22,6 +26,7 @@ impl Default for McpConfig {
     fn default() -> Self {
         Self {
             client_enabled: true,
+            server_enabled: false,
             servers: HashMap::new(),
         }
     }
@@ -137,6 +142,7 @@ mod tests {
     fn test_default_config() {
         let config = McpConfig::default();
         assert!(config.client_enabled);
+        assert!(!config.server_enabled);
         assert!(config.servers.is_empty());
     }
 
@@ -205,6 +211,17 @@ mod tests {
     fn test_server_permissions_default() {
         let perms = McpServerPermissions::default();
         assert_eq!(perms.trust_level, "untrusted");
+    }
+
+    #[test]
+    fn test_deserialize_server_enabled() {
+        let toml_str = r#"
+            client_enabled = true
+            server_enabled = true
+        "#;
+        let config: McpConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.client_enabled);
+        assert!(config.server_enabled);
     }
 
     #[test]

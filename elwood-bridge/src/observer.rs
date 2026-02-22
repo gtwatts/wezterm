@@ -20,17 +20,97 @@ use std::sync::Arc;
 use std::time::Instant;
 use wezterm_term::StableRowIndex;
 
+// ─── Error Detection Types ──────────────────────────────────────────────────
+
+/// The broad category of an error detected in terminal output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ErrorType {
+    /// Compile-time error (Rust, C/C++, TypeScript, Go).
+    Compile,
+    /// Runtime error (Python traceback, Node.js TypeError, panics).
+    Runtime,
+    /// Test failure (cargo test, pytest, jest, go test).
+    Test,
+    /// Permission denied, EACCES, sudo required.
+    Permission,
+    /// File or command not found, ENOENT.
+    NotFound,
+    /// Git conflict or git fatal error.
+    Git,
+    /// General error that doesn't fit other categories.
+    General,
+}
+
+impl fmt::Display for ErrorType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Compile => write!(f, "compile"),
+            Self::Runtime => write!(f, "runtime"),
+            Self::Test => write!(f, "test"),
+            Self::Permission => write!(f, "permission"),
+            Self::NotFound => write!(f, "not_found"),
+            Self::Git => write!(f, "git"),
+            Self::General => write!(f, "general"),
+        }
+    }
+}
+
+/// Severity level for a detected error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Severity {
+    /// Informational (warnings, hints).
+    Info,
+    /// A real error that likely needs fixing.
+    Error,
+    /// A critical/fatal error that blocks progress.
+    Fatal,
+}
+
+impl fmt::Display for Severity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Info => write!(f, "info"),
+            Self::Error => write!(f, "error"),
+            Self::Fatal => write!(f, "fatal"),
+        }
+    }
+}
+
+/// A structured error detection extracted from terminal output.
+///
+/// Produced by [`ContentDetector::detect_errors`] with richer metadata
+/// than the legacy [`ContextualContent`] type.
+#[derive(Debug, Clone)]
+pub struct ErrorDetection {
+    /// Broad category of the error.
+    pub error_type: ErrorType,
+    /// Severity level.
+    pub severity: Severity,
+    /// The raw error message line(s) extracted from output.
+    pub message: String,
+    /// A human-readable suggested fix command or action.
+    pub suggested_fix: String,
+    /// Source file extracted from the error, if any.
+    pub source_file: Option<String>,
+    /// Whether this fix can be applied automatically (without LLM).
+    pub auto_fixable: bool,
+}
+
 /// A snapshot of a pane's visible content at a point in time.
 #[derive(Debug, Clone)]
 pub struct PaneSnapshot {
+    /// The pane ID this snapshot belongs to.
+    pub pane_id: PaneId,
     /// The visible text lines.
     pub lines: Vec<String>,
     /// When this snapshot was taken.
     pub timestamp: Instant,
     /// The pane's title at snapshot time.
     pub title: String,
-    /// Number of rows in the viewport.
-    pub viewport_rows: usize,
+    /// Cursor row position (stable index).
+    pub cursor_row: i64,
+    /// Terminal dimensions (cols, rows).
+    pub dimensions: (usize, usize),
 }
 
 /// The type of actionable content detected in a pane.
@@ -82,28 +162,81 @@ pub struct ContextualContent {
 ///
 /// Pre-compiles regexes on construction for efficient repeated use.
 pub struct ContentDetector {
+    // ── Rust ────────────────────────────────────────────────────────────
     // Rust compiler errors: `error[E0308]: ...` or `error: ...`
     rust_error: Regex,
     // Rust compiler warnings: `warning: ...` or `warning[...]:`
     rust_warning: Regex,
     // File location: `  --> src/main.rs:12:5`
     rust_location: Regex,
+    // Rust "cannot find" errors
+    rust_cannot_find: Regex,
+    // Rust "expected ... found" type mismatch
+    rust_expected_found: Regex,
+    // Rust backtrace / panic
+    rust_panic: Regex,
+
+    // ── General file location ─────────────────────────────────────────
     // General file:line:col pattern (gcc, clang, TypeScript, etc.)
     file_line_col: Regex,
     // file:line:col followed by "error" (gcc, clang, TypeScript diagnostics)
     file_line_col_error: Regex,
+
+    // ── Python ─────────────────────────────────────────────────────────
+    // Python traceback
+    python_traceback: Regex,
+    // Python SyntaxError
+    python_syntax_error: Regex,
+    // Python ImportError / ModuleNotFoundError
+    python_import_error: Regex,
+    // Python NameError / AttributeError / TypeError / ValueError
+    python_runtime_error: Regex,
+
+    // ── JavaScript / TypeScript ────────────────────────────────────────
+    // JS SyntaxError / TypeError / ReferenceError
+    js_error: Regex,
+    // "Cannot find module" (Node.js)
+    js_cannot_find_module: Regex,
+    // Node.js / JS stack trace line: `at Foo (/path:line:col)` or `at /path:line:col`
+    node_stack: Regex,
+
+    // ── Go ──────────────────────────────────────────────────────────────
+    // Go "cannot find package" or "undefined:"
+    go_error: Regex,
+    // Go "syntax error"
+    go_syntax_error: Regex,
+
+    // ── Git ──────────────────────────────────────────────────────────────
+    // Git merge conflicts
+    git_conflict: Regex,
+    // Git fatal errors
+    git_fatal: Regex,
+    // Git generic errors
+    _git_error: Regex,
+
+    // ── General / OS ───────────────────────────────────────────────────
+    // Permission denied
+    permission_denied: Regex,
+    // No such file or directory
+    no_such_file: Regex,
+    // command not found
+    command_not_found: Regex,
+    // EACCES / ENOENT (Node.js / system)
+    errno_pattern: Regex,
+
+    // ── Test failures ──────────────────────────────────────────────────
     // Test failure: "FAILED" keyword
     test_failed: Regex,
     // "0 failed" — used to exclude false positives from passing test summaries
     zero_failed: Regex,
     // Rust test summary line — specifically the failing variant
     test_result_failed: Regex,
-    // Python traceback
-    python_traceback: Regex,
-    // Node.js / JS stack trace line: `at Foo (/path:line:col)` or `at /path:line:col`
-    node_stack: Regex,
-    // Rust backtrace / panic
-    rust_panic: Regex,
+    // "assertion failed" / "AssertionError"
+    assertion_failed: Regex,
+    // pytest / jest "FAIL:" prefix
+    test_fail_prefix: Regex,
+
+    // ── Exit codes ─────────────────────────────────────────────────────
     // Non-zero exit code from shell prompt
     exit_code: Regex,
 }
@@ -112,18 +245,58 @@ impl ContentDetector {
     /// Create a new detector with pre-compiled patterns.
     pub fn new() -> Self {
         Self {
+            // ── Rust ────────────────────────────────────────────────
             rust_error: Regex::new(r"^error(\[E\d+\])?:").expect("valid regex"),
             rust_warning: Regex::new(r"^warning(\[\w+\])?:").expect("valid regex"),
             rust_location: Regex::new(r"^\s*-->\s+(.+):(\d+):(\d+)").expect("valid regex"),
+            rust_cannot_find: Regex::new(r"cannot find (?:crate|value|type|trait|module|macro) `(\w+)`").expect("valid regex"),
+            rust_expected_found: Regex::new(r"expected .+, found .+").expect("valid regex"),
+            rust_panic: Regex::new(r"^thread '.*' panicked at").expect("valid regex"),
+
+            // ── General file location ─────────────────────────────
             file_line_col: Regex::new(r"^(.+?\.\w+):(\d+):(\d+)").expect("valid regex"),
             file_line_col_error: Regex::new(r"^.+?\.\w+:\d+:\d+.*\berror\b").expect("valid regex"),
+
+            // ── Python ─────────────────────────────────────────────
+            python_traceback: Regex::new(r"^Traceback \(most recent call last\):")
+                .expect("valid regex"),
+            python_syntax_error: Regex::new(r"^\s*SyntaxError:").expect("valid regex"),
+            python_import_error: Regex::new(r"^(?:ImportError|ModuleNotFoundError):\s*(.+)")
+                .expect("valid regex"),
+            python_runtime_error: Regex::new(
+                r"^(?:NameError|AttributeError|TypeError|ValueError|KeyError|IndexError|ZeroDivisionError):\s*(.+)"
+            ).expect("valid regex"),
+
+            // ── JavaScript / TypeScript ────────────────────────────
+            js_error: Regex::new(
+                r"^(?:SyntaxError|TypeError|ReferenceError|RangeError|URIError|EvalError):\s*(.+)"
+            ).expect("valid regex"),
+            js_cannot_find_module: Regex::new(r"Cannot find module '([^']+)'").expect("valid regex"),
+            node_stack: Regex::new(r"^\s+at\s+").expect("valid regex"),
+
+            // ── Go ──────────────────────────────────────────────────
+            go_error: Regex::new(r"(?:cannot find package|undefined:)\s*(.+)").expect("valid regex"),
+            go_syntax_error: Regex::new(r"syntax error").expect("valid regex"),
+
+            // ── Git ──────────────────────────────────────────────────
+            git_conflict: Regex::new(r"(?i)(?:CONFLICT|merge conflict|Merge conflict)").expect("valid regex"),
+            git_fatal: Regex::new(r"^fatal:\s*(.+)").expect("valid regex"),
+            _git_error: Regex::new(r"^error:\s*(.+)").expect("valid regex"),
+
+            // ── General / OS ────────────────────────────────────────
+            permission_denied: Regex::new(r"(?i)permission denied").expect("valid regex"),
+            no_such_file: Regex::new(r"(?i)no such file or directory").expect("valid regex"),
+            command_not_found: Regex::new(r"(?:command not found|not found)$").expect("valid regex"),
+            errno_pattern: Regex::new(r"\bE(?:ACCES|NOENT|PERM)\b").expect("valid regex"),
+
+            // ── Test failures ───────────────────────────────────────
             test_failed: Regex::new(r"(?i)\bFAILED\b").expect("valid regex"),
             zero_failed: Regex::new(r"(?i)\b0 failed\b").expect("valid regex"),
             test_result_failed: Regex::new(r"test result: FAILED").expect("valid regex"),
-            python_traceback: Regex::new(r"^Traceback \(most recent call last\):")
-                .expect("valid regex"),
-            node_stack: Regex::new(r"^\s+at\s+").expect("valid regex"),
-            rust_panic: Regex::new(r"^thread '.*' panicked at").expect("valid regex"),
+            assertion_failed: Regex::new(r"(?i)(?:assertion failed|AssertionError|assert\.fail)").expect("valid regex"),
+            test_fail_prefix: Regex::new(r"^(?:FAIL:|FAIL\s|failures:)").expect("valid regex"),
+
+            // ── Exit codes ──────────────────────────────────────────
             exit_code: Regex::new(r"exit (?:code|status)[:\s]+(\d+)").expect("valid regex"),
         }
     }
@@ -350,6 +523,290 @@ impl ContentDetector {
         }
         None
     }
+
+    // ── Enhanced error detection with structured results ─────────────────
+
+    /// Analyze lines of terminal output and return structured error detections.
+    ///
+    /// Unlike [`detect`], this method returns [`ErrorDetection`] structs with
+    /// error type classification, severity, and suggested fixes.
+    pub fn detect_errors(&self, lines: &[String]) -> Vec<ErrorDetection> {
+        let mut results = Vec::new();
+
+        // Helper to extract source file from nearby lines
+        let extract_source_file = |lines: &[String]| -> Option<String> {
+            lines.iter().find_map(|line| {
+                let trimmed = line.trim();
+                if let Some(caps) = self.rust_location.captures(trimmed) {
+                    return Some(caps[1].to_string());
+                }
+                if let Some(caps) = self.file_line_col.captures(trimmed) {
+                    let path = &caps[1];
+                    if path.contains('/') || path.contains('\\') || path.contains('.') {
+                        return Some(path.to_string());
+                    }
+                }
+                None
+            })
+        };
+
+        for line in lines {
+            let trimmed = line.trim();
+
+            // ── Rust compiler errors ────────────────────────────────
+            if self.rust_error.is_match(trimmed) {
+                let is_cannot_find = self.rust_cannot_find.is_match(trimmed);
+                let fix = if is_cannot_find {
+                    if let Some(caps) = self.rust_cannot_find.captures(trimmed) {
+                        format!("cargo add {}", &caps[1])
+                    } else {
+                        "Check spelling and imports".to_string()
+                    }
+                } else if self.rust_expected_found.is_match(trimmed) {
+                    "Fix the type mismatch in the highlighted expression".to_string()
+                } else {
+                    "Press Ctrl+F to ask Elwood to fix this error".to_string()
+                };
+
+                results.push(ErrorDetection {
+                    error_type: ErrorType::Compile,
+                    severity: Severity::Error,
+                    message: trimmed.to_string(),
+                    suggested_fix: fix,
+                    source_file: extract_source_file(lines),
+                    auto_fixable: is_cannot_find,
+                });
+                continue;
+            }
+
+            // ── Rust warnings ───────────────────────────────────────
+            if self.rust_warning.is_match(trimmed) {
+                results.push(ErrorDetection {
+                    error_type: ErrorType::Compile,
+                    severity: Severity::Info,
+                    message: trimmed.to_string(),
+                    suggested_fix: "cargo clippy --fix".to_string(),
+                    source_file: extract_source_file(lines),
+                    auto_fixable: true,
+                });
+                continue;
+            }
+
+            // ── Python errors ──────────────────────────────────────
+            if self.python_syntax_error.is_match(trimmed) {
+                results.push(ErrorDetection {
+                    error_type: ErrorType::Compile,
+                    severity: Severity::Error,
+                    message: trimmed.to_string(),
+                    suggested_fix: "Fix the syntax error at the indicated line".to_string(),
+                    source_file: extract_source_file(lines),
+                    auto_fixable: false,
+                });
+                continue;
+            }
+            if let Some(caps) = self.python_import_error.captures(trimmed) {
+                let module = caps.get(1).map(|m| m.as_str()).unwrap_or("unknown");
+                results.push(ErrorDetection {
+                    error_type: ErrorType::NotFound,
+                    severity: Severity::Error,
+                    message: trimmed.to_string(),
+                    suggested_fix: format!("pip install {module}"),
+                    source_file: extract_source_file(lines),
+                    auto_fixable: true,
+                });
+                continue;
+            }
+            if self.python_runtime_error.is_match(trimmed) {
+                results.push(ErrorDetection {
+                    error_type: ErrorType::Runtime,
+                    severity: Severity::Error,
+                    message: trimmed.to_string(),
+                    suggested_fix: "Press Ctrl+F to ask Elwood to fix this error".to_string(),
+                    source_file: extract_source_file(lines),
+                    auto_fixable: false,
+                });
+                continue;
+            }
+            if self.python_traceback.is_match(trimmed) {
+                results.push(ErrorDetection {
+                    error_type: ErrorType::Runtime,
+                    severity: Severity::Error,
+                    message: trimmed.to_string(),
+                    suggested_fix: "Press Ctrl+F to ask Elwood to fix this error".to_string(),
+                    source_file: extract_source_file(lines),
+                    auto_fixable: false,
+                });
+                continue;
+            }
+
+            // ── JavaScript/TypeScript errors ───────────────────────
+            if self.js_error.is_match(trimmed) {
+                results.push(ErrorDetection {
+                    error_type: ErrorType::Runtime,
+                    severity: Severity::Error,
+                    message: trimmed.to_string(),
+                    suggested_fix: "Press Ctrl+F to ask Elwood to fix this error".to_string(),
+                    source_file: extract_source_file(lines),
+                    auto_fixable: false,
+                });
+                continue;
+            }
+            if let Some(caps) = self.js_cannot_find_module.captures(trimmed) {
+                let module = caps.get(1).map(|m| m.as_str()).unwrap_or("unknown");
+                results.push(ErrorDetection {
+                    error_type: ErrorType::NotFound,
+                    severity: Severity::Error,
+                    message: trimmed.to_string(),
+                    suggested_fix: format!("npm install {module}"),
+                    source_file: extract_source_file(lines),
+                    auto_fixable: true,
+                });
+                continue;
+            }
+
+            // ── Go errors ──────────────────────────────────────────
+            if self.go_error.is_match(trimmed) || self.go_syntax_error.is_match(trimmed) {
+                results.push(ErrorDetection {
+                    error_type: ErrorType::Compile,
+                    severity: Severity::Error,
+                    message: trimmed.to_string(),
+                    suggested_fix: "Press Ctrl+F to ask Elwood to fix this error".to_string(),
+                    source_file: extract_source_file(lines),
+                    auto_fixable: false,
+                });
+                continue;
+            }
+
+            // ── Git errors ─────────────────────────────────────────
+            if self.git_conflict.is_match(trimmed) {
+                results.push(ErrorDetection {
+                    error_type: ErrorType::Git,
+                    severity: Severity::Error,
+                    message: trimmed.to_string(),
+                    suggested_fix: "Resolve merge conflicts, then git add and git commit".to_string(),
+                    source_file: None,
+                    auto_fixable: false,
+                });
+                continue;
+            }
+            if self.git_fatal.is_match(trimmed) {
+                results.push(ErrorDetection {
+                    error_type: ErrorType::Git,
+                    severity: Severity::Fatal,
+                    message: trimmed.to_string(),
+                    suggested_fix: "Press Ctrl+F to ask Elwood to diagnose the git error".to_string(),
+                    source_file: None,
+                    auto_fixable: false,
+                });
+                continue;
+            }
+
+            // ── Permission denied ──────────────────────────────────
+            if self.permission_denied.is_match(trimmed) || self.errno_pattern.is_match(trimmed) {
+                if trimmed.contains("EACCES") || trimmed.contains("EPERM") || self.permission_denied.is_match(trimmed) {
+                    results.push(ErrorDetection {
+                        error_type: ErrorType::Permission,
+                        severity: Severity::Error,
+                        message: trimmed.to_string(),
+                        suggested_fix: "Check file permissions or run with appropriate privileges".to_string(),
+                        source_file: None,
+                        auto_fixable: false,
+                    });
+                    continue;
+                }
+            }
+
+            // ── No such file / command not found ───────────────────
+            if self.no_such_file.is_match(trimmed) {
+                results.push(ErrorDetection {
+                    error_type: ErrorType::NotFound,
+                    severity: Severity::Error,
+                    message: trimmed.to_string(),
+                    suggested_fix: "Check the file path exists".to_string(),
+                    source_file: None,
+                    auto_fixable: false,
+                });
+                continue;
+            }
+            if self.command_not_found.is_match(trimmed) {
+                results.push(ErrorDetection {
+                    error_type: ErrorType::NotFound,
+                    severity: Severity::Error,
+                    message: trimmed.to_string(),
+                    suggested_fix: "Install the missing command or check your PATH".to_string(),
+                    source_file: None,
+                    auto_fixable: false,
+                });
+                continue;
+            }
+            if trimmed.contains("ENOENT") {
+                results.push(ErrorDetection {
+                    error_type: ErrorType::NotFound,
+                    severity: Severity::Error,
+                    message: trimmed.to_string(),
+                    suggested_fix: "Check the file path exists".to_string(),
+                    source_file: None,
+                    auto_fixable: false,
+                });
+                continue;
+            }
+
+            // ── Test failures ──────────────────────────────────────
+            if self.test_result_failed.is_match(trimmed)
+                || self.test_fail_prefix.is_match(trimmed)
+                || self.assertion_failed.is_match(trimmed)
+            {
+                results.push(ErrorDetection {
+                    error_type: ErrorType::Test,
+                    severity: Severity::Error,
+                    message: trimmed.to_string(),
+                    suggested_fix: "Press Ctrl+F to ask Elwood to fix the failing tests".to_string(),
+                    source_file: extract_source_file(lines),
+                    auto_fixable: false,
+                });
+                continue;
+            }
+            // "FAILED" keyword (but not "0 failed")
+            if self.test_failed.is_match(trimmed) && !self.zero_failed.is_match(trimmed) {
+                results.push(ErrorDetection {
+                    error_type: ErrorType::Test,
+                    severity: Severity::Error,
+                    message: trimmed.to_string(),
+                    suggested_fix: "Press Ctrl+F to ask Elwood to fix the failing tests".to_string(),
+                    source_file: extract_source_file(lines),
+                    auto_fixable: false,
+                });
+                continue;
+            }
+
+            // ── Rust panic ─────────────────────────────────────────
+            if self.rust_panic.is_match(trimmed) {
+                results.push(ErrorDetection {
+                    error_type: ErrorType::Runtime,
+                    severity: Severity::Fatal,
+                    message: trimmed.to_string(),
+                    suggested_fix: "Press Ctrl+F to ask Elwood to fix the panic".to_string(),
+                    source_file: extract_source_file(lines),
+                    auto_fixable: false,
+                });
+                continue;
+            }
+
+            // ── file:line:col error (gcc, clang, TypeScript) ───────
+            if self.file_line_col_error.is_match(trimmed) {
+                results.push(ErrorDetection {
+                    error_type: ErrorType::Compile,
+                    severity: Severity::Error,
+                    message: trimmed.to_string(),
+                    suggested_fix: "Press Ctrl+F to ask Elwood to fix this error".to_string(),
+                    source_file: extract_source_file(lines),
+                    auto_fixable: false,
+                });
+            }
+        }
+
+        results
+    }
 }
 
 impl Default for ContentDetector {
@@ -413,6 +870,7 @@ impl PaneObserver {
                     if let Some(mux) = mux {
                         if let Some(pane) = mux.get_pane(pane_id) {
                             let dims = pane.get_dimensions();
+                            let cursor = pane.get_cursor_position();
                             let range = dims.physical_top
                                 ..dims.physical_top + dims.viewport_rows as StableRowIndex;
                             let (_first, lines) = pane.get_lines(range);
@@ -421,10 +879,12 @@ impl PaneObserver {
                                 lines.iter().map(|l| l.as_str().to_string()).collect();
 
                             let snapshot = PaneSnapshot {
+                                pane_id,
                                 lines: text_lines,
                                 timestamp: Instant::now(),
                                 title: pane.get_title(),
-                                viewport_rows: dims.viewport_rows,
+                                cursor_row: cursor.y as i64,
+                                dimensions: (dims.cols, dims.viewport_rows),
                             };
 
                             cache.write().insert(pane_id, snapshot);
@@ -492,17 +952,160 @@ impl PaneObserver {
         let mux = Mux::try_get()?;
         let pane = mux.get_pane(pane_id)?;
         let dims = pane.get_dimensions();
+        let cursor = pane.get_cursor_position();
         let range = dims.physical_top..dims.physical_top + dims.viewport_rows as StableRowIndex;
         let (_first, lines) = pane.get_lines(range);
 
         let text_lines: Vec<String> = lines.iter().map(|l| l.as_str().to_string()).collect();
 
         Some(PaneSnapshot {
+            pane_id,
             lines: text_lines,
             timestamp: Instant::now(),
             title: pane.get_title(),
-            viewport_rows: dims.viewport_rows,
+            cursor_row: cursor.y as i64,
+            dimensions: (dims.cols, dims.viewport_rows),
         })
+    }
+
+    /// Scan all sibling panes and return fresh snapshots.
+    ///
+    /// Reads content from every pane in the mux except the agent's own pane.
+    /// This is a point-in-time read that bypasses the notification cache.
+    pub fn scan_sibling_panes(&self) -> Vec<PaneSnapshot> {
+        let mux = match Mux::try_get() {
+            Some(m) => m,
+            None => return Vec::new(),
+        };
+
+        let mut snapshots = Vec::new();
+        for pane in mux.iter_panes() {
+            let id = pane.pane_id();
+            if id == self.own_pane_id || pane.is_dead() {
+                continue;
+            }
+
+            let dims = pane.get_dimensions();
+            let cursor = pane.get_cursor_position();
+            // Read the last N lines of visible content (viewport)
+            let range = dims.physical_top
+                ..dims.physical_top + dims.viewport_rows as StableRowIndex;
+            let (_first, lines) = pane.get_lines(range);
+
+            let text_lines: Vec<String> =
+                lines.iter().map(|l| l.as_str().to_string()).collect();
+
+            snapshots.push(PaneSnapshot {
+                pane_id: id,
+                lines: text_lines,
+                timestamp: Instant::now(),
+                title: pane.get_title(),
+                cursor_row: cursor.y as i64,
+                dimensions: (dims.cols, dims.viewport_rows),
+            });
+        }
+
+        // Update the cache with fresh data
+        {
+            let mut cache = self.cache.write();
+            for snap in &snapshots {
+                cache.insert(snap.pane_id, snap.clone());
+            }
+        }
+
+        snapshots
+    }
+
+    /// Get content from a specific sibling pane (on demand, not from cache).
+    pub fn get_pane_content(&self, pane_id: PaneId) -> Option<PaneSnapshot> {
+        if pane_id == self.own_pane_id {
+            return None;
+        }
+        Self::read_pane_now(pane_id)
+    }
+
+    /// Detect errors in all sibling panes.
+    ///
+    /// Returns `(pane_id, error_summary)` pairs for each pane that has errors.
+    pub fn detect_errors_in_siblings(&self) -> Vec<(PaneId, String)> {
+        let snapshots = self.scan_sibling_panes();
+        let mut errors = Vec::new();
+
+        for snap in &snapshots {
+            let detections = self.detector.detect(snap.pane_id, &snap.lines, snap.timestamp);
+            for det in detections {
+                let summary = match det.content_type {
+                    ContentType::CompilerError => {
+                        format!("Compiler error in '{}': {}", snap.title,
+                            det.text.lines().next().unwrap_or("(unknown)"))
+                    }
+                    ContentType::TestFailure => {
+                        format!("Test failure in '{}': {}", snap.title,
+                            det.text.lines().next().unwrap_or("(unknown)"))
+                    }
+                    ContentType::StackTrace => {
+                        format!("Stack trace in '{}': {}", snap.title,
+                            det.text.lines().next().unwrap_or("(unknown)"))
+                    }
+                    ContentType::CommandOutput => {
+                        format!("Command error in '{}': {}", snap.title,
+                            det.text.lines().next().unwrap_or("(unknown)"))
+                    }
+                    ContentType::Unknown => {
+                        format!("Error in '{}': {}", snap.title,
+                            det.text.lines().next().unwrap_or("(unknown)"))
+                    }
+                };
+                errors.push((snap.pane_id, summary));
+            }
+        }
+
+        errors
+    }
+
+    /// Format sibling pane content for injection into the agent's LLM context.
+    ///
+    /// Returns a string with the last `max_lines` lines from each sibling pane,
+    /// formatted for the LLM to understand. Empty if no siblings or no content.
+    pub fn format_context_for_agent(&self, max_lines_per_pane: usize) -> String {
+        let snapshots = self.scan_sibling_panes();
+        if snapshots.is_empty() {
+            return String::new();
+        }
+
+        let mut ctx = String::from("[Sibling Panes]\n");
+
+        for snap in &snapshots {
+            // Take the last N lines (most recent output)
+            let start = snap.lines.len().saturating_sub(max_lines_per_pane);
+            let recent: Vec<&str> = snap.lines[start..].iter().map(|s| s.as_str()).collect();
+
+            // Skip panes with only blank content
+            if recent.iter().all(|l| l.trim().is_empty()) {
+                continue;
+            }
+
+            ctx.push_str(&format!(
+                "<pane id=\"{}\" title=\"{}\" dims=\"{}x{}\">\n",
+                snap.pane_id, snap.title, snap.dimensions.0, snap.dimensions.1,
+            ));
+            for line in &recent {
+                ctx.push_str(line);
+                ctx.push('\n');
+            }
+            ctx.push_str("</pane>\n");
+        }
+
+        // Check for errors and append a summary
+        let errors = self.detect_errors_in_siblings();
+        if !errors.is_empty() {
+            ctx.push_str("\n[Detected Errors in Sibling Panes]\n");
+            for (pane_id, summary) in &errors {
+                ctx.push_str(&format!("- Pane {pane_id}: {summary}\n"));
+            }
+        }
+
+        ctx
     }
 
     /// List all panes with their IDs, titles, and process info.
@@ -1010,5 +1613,238 @@ exit code: 1"#;
     fn suggester_default_works() {
         let s = NextCommandSuggester::default();
         assert!(s.suggest("cargo build", false).is_some());
+    }
+
+    // ---- Enhanced detect_errors tests ----
+
+    fn detect_errors(input: &str) -> Vec<ErrorDetection> {
+        let d = ContentDetector::new();
+        d.detect_errors(&lines(input))
+    }
+
+    #[test]
+    fn detect_errors_rust_compile_error() {
+        let results = detect_errors("error[E0308]: mismatched types");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].error_type, ErrorType::Compile);
+        assert_eq!(results[0].severity, Severity::Error);
+        assert!(results[0].message.contains("E0308"));
+    }
+
+    #[test]
+    fn detect_errors_rust_cannot_find_suggests_cargo_add() {
+        let results = detect_errors("error[E0432]: cannot find crate `serde`");
+        assert!(!results.is_empty());
+        assert!(results[0].suggested_fix.contains("cargo add"));
+        assert!(results[0].auto_fixable);
+    }
+
+    #[test]
+    fn detect_errors_rust_warning() {
+        let results = detect_errors("warning: unused variable: `x`");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].error_type, ErrorType::Compile);
+        assert_eq!(results[0].severity, Severity::Info);
+        assert!(results[0].suggested_fix.contains("clippy"));
+        assert!(results[0].auto_fixable);
+    }
+
+    #[test]
+    fn detect_errors_python_syntax_error() {
+        let results = detect_errors("  SyntaxError: invalid syntax");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].error_type, ErrorType::Compile);
+        assert_eq!(results[0].severity, Severity::Error);
+    }
+
+    #[test]
+    fn detect_errors_python_import_error_suggests_pip() {
+        let results = detect_errors("ModuleNotFoundError: No module named 'requests'");
+        assert!(!results.is_empty());
+        assert_eq!(results[0].error_type, ErrorType::NotFound);
+        assert!(results[0].suggested_fix.contains("pip install"));
+        assert!(results[0].auto_fixable);
+    }
+
+    #[test]
+    fn detect_errors_python_runtime_errors() {
+        for err in &[
+            "NameError: name 'foo' is not defined",
+            "TypeError: unsupported operand type(s)",
+            "ValueError: invalid literal",
+            "KeyError: 'missing_key'",
+            "AttributeError: 'NoneType' object has no attribute 'foo'",
+        ] {
+            let results = detect_errors(err);
+            assert!(!results.is_empty(), "Should detect: {err}");
+            assert_eq!(results[0].error_type, ErrorType::Runtime);
+        }
+    }
+
+    #[test]
+    fn detect_errors_python_traceback() {
+        let results = detect_errors("Traceback (most recent call last):");
+        assert!(!results.is_empty());
+        assert_eq!(results[0].error_type, ErrorType::Runtime);
+    }
+
+    #[test]
+    fn detect_errors_js_error() {
+        let results = detect_errors("TypeError: Cannot read properties of undefined");
+        assert!(!results.is_empty());
+        assert_eq!(results[0].error_type, ErrorType::Runtime);
+    }
+
+    #[test]
+    fn detect_errors_js_cannot_find_module_suggests_npm() {
+        let results = detect_errors("Cannot find module 'express'");
+        assert!(!results.is_empty());
+        assert_eq!(results[0].error_type, ErrorType::NotFound);
+        assert!(results[0].suggested_fix.contains("npm install"));
+        assert!(results[0].auto_fixable);
+    }
+
+    #[test]
+    fn detect_errors_js_syntax_error() {
+        let results = detect_errors("SyntaxError: Unexpected token '}'");
+        assert!(!results.is_empty());
+        // SyntaxError is a parse/compile-time error
+        assert_eq!(results[0].error_type, ErrorType::Compile);
+    }
+
+    #[test]
+    fn detect_errors_go_error() {
+        let results = detect_errors("undefined: myFunction");
+        assert!(!results.is_empty());
+        assert_eq!(results[0].error_type, ErrorType::Compile);
+    }
+
+    #[test]
+    fn detect_errors_git_conflict() {
+        let results = detect_errors("CONFLICT (content): Merge conflict in src/main.rs");
+        assert!(!results.is_empty());
+        assert_eq!(results[0].error_type, ErrorType::Git);
+        assert!(results[0].suggested_fix.contains("Resolve merge conflicts"));
+    }
+
+    #[test]
+    fn detect_errors_git_fatal() {
+        let results = detect_errors("fatal: not a git repository");
+        assert!(!results.is_empty());
+        assert_eq!(results[0].error_type, ErrorType::Git);
+        assert_eq!(results[0].severity, Severity::Fatal);
+    }
+
+    #[test]
+    fn detect_errors_permission_denied() {
+        let results = detect_errors("bash: /etc/shadow: Permission denied");
+        assert!(!results.is_empty());
+        assert_eq!(results[0].error_type, ErrorType::Permission);
+    }
+
+    #[test]
+    fn detect_errors_eacces() {
+        let results = detect_errors("Error: EACCES: permission denied, open '/root/.config'");
+        assert!(!results.is_empty());
+        assert_eq!(results[0].error_type, ErrorType::Permission);
+    }
+
+    #[test]
+    fn detect_errors_no_such_file() {
+        let results = detect_errors("ls: cannot access 'foo': No such file or directory");
+        assert!(!results.is_empty());
+        assert_eq!(results[0].error_type, ErrorType::NotFound);
+    }
+
+    #[test]
+    fn detect_errors_command_not_found() {
+        let results = detect_errors("bash: foobar: command not found");
+        assert!(!results.is_empty());
+        assert_eq!(results[0].error_type, ErrorType::NotFound);
+        assert!(results[0].suggested_fix.contains("PATH"));
+    }
+
+    #[test]
+    fn detect_errors_enoent() {
+        let results = detect_errors("Error: ENOENT: no such file or directory, open 'foo.txt'");
+        assert!(!results.is_empty());
+        assert_eq!(results[0].error_type, ErrorType::NotFound);
+    }
+
+    #[test]
+    fn detect_errors_test_result_failed() {
+        let results = detect_errors("test result: FAILED. 1 passed; 2 failed; 0 ignored");
+        assert!(!results.is_empty());
+        assert_eq!(results[0].error_type, ErrorType::Test);
+    }
+
+    #[test]
+    fn detect_errors_assertion_failed() {
+        let results = detect_errors("assertion failed: `(left == right)`");
+        assert!(!results.is_empty());
+        assert_eq!(results[0].error_type, ErrorType::Test);
+    }
+
+    #[test]
+    fn detect_errors_jest_fail() {
+        let results = detect_errors("FAIL: src/app.test.ts");
+        assert!(!results.is_empty());
+        assert_eq!(results[0].error_type, ErrorType::Test);
+    }
+
+    #[test]
+    fn detect_errors_rust_panic() {
+        let results = detect_errors("thread 'main' panicked at 'index out of bounds'");
+        assert!(!results.is_empty());
+        assert_eq!(results[0].error_type, ErrorType::Runtime);
+        assert_eq!(results[0].severity, Severity::Fatal);
+    }
+
+    #[test]
+    fn detect_errors_file_line_col_error() {
+        let results = detect_errors("src/main.c:42:10: error: expected ';'");
+        assert!(!results.is_empty());
+        assert_eq!(results[0].error_type, ErrorType::Compile);
+    }
+
+    #[test]
+    fn detect_errors_clean_output_empty() {
+        let results = detect_errors("   Compiling my-crate v0.1.0\n    Finished dev in 0.52s");
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn detect_errors_multiple_errors() {
+        let input = "error[E0308]: mismatched types\nwarning: unused variable";
+        let results = detect_errors(input);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].error_type, ErrorType::Compile);
+        assert_eq!(results[0].severity, Severity::Error);
+        assert_eq!(results[1].error_type, ErrorType::Compile);
+        assert_eq!(results[1].severity, Severity::Info);
+    }
+
+    #[test]
+    fn detect_errors_error_type_display() {
+        assert_eq!(ErrorType::Compile.to_string(), "compile");
+        assert_eq!(ErrorType::Runtime.to_string(), "runtime");
+        assert_eq!(ErrorType::Test.to_string(), "test");
+        assert_eq!(ErrorType::Permission.to_string(), "permission");
+        assert_eq!(ErrorType::NotFound.to_string(), "not_found");
+        assert_eq!(ErrorType::Git.to_string(), "git");
+        assert_eq!(ErrorType::General.to_string(), "general");
+    }
+
+    #[test]
+    fn detect_errors_severity_display() {
+        assert_eq!(Severity::Info.to_string(), "info");
+        assert_eq!(Severity::Error.to_string(), "error");
+        assert_eq!(Severity::Fatal.to_string(), "fatal");
+    }
+
+    #[test]
+    fn detect_errors_severity_ordering() {
+        assert!(Severity::Info < Severity::Error);
+        assert!(Severity::Error < Severity::Fatal);
     }
 }

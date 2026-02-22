@@ -115,10 +115,8 @@ pub fn format_response(response: &AgentResponse) -> String {
 
         AgentResponse::Shutdown => format_shutdown(),
 
-        // FileEdit and PtyScreenSnapshot are rendered by specialized handlers
-        AgentResponse::FileEdit { .. } | AgentResponse::PtyScreenSnapshot { .. } => {
-            String::new()
-        }
+        // All other response types are rendered by their respective subsystems
+        _ => String::new(),
     }
 }
 

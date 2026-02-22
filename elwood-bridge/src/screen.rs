@@ -1176,6 +1176,144 @@ pub fn render_shortcut_overlay(state: &ScreenState) -> String {
     out
 }
 
+/// Render a suggestion overlay box in the chat area.
+///
+/// Displays the active suggestion from the [`SuggestionManager`] as an
+/// absolute-positioned overlay at the bottom of the chat area. Shows the
+/// error message, suggested fix, and keybinding hints.
+///
+/// ```text
+/// ╭─ ⚡ Error Fix ───────────────────────────────────────╮
+/// │  error[E0308]: mismatched types                       │
+/// │                                                       │
+/// │  Suggested fix: cargo add serde                       │
+/// │                                                       │
+/// │  [Enter] Apply   [Tab] Next (2 more)   [Esc] Dismiss │
+/// ╰──────────────────────────────────────────────────────╯
+/// ```
+pub fn render_suggestion_overlay(
+    state: &ScreenState,
+    suggestion: &crate::suggestion_overlay::Suggestion,
+    visible_count: usize,
+) -> String {
+    let err_fg = fgc(ERROR);
+    let warn_fg = fgc(WARNING);
+    let success_fg = fgc(SUCCESS);
+    let fgv = fgc(FG);
+    let muted = fgc(MUTED);
+    let key_bg = bgc(SELECTION);
+    let key_fg = fgc(FG);
+    let r = RESET;
+
+    let box_w = 56usize;
+    let hline: String = std::iter::repeat(BOX_H).take(box_w).collect();
+
+    // Pick the severity color for the title
+    let severity_color = match suggestion.severity {
+        crate::observer::Severity::Fatal => &err_fg,
+        crate::observer::Severity::Error => &err_fg,
+        crate::observer::Severity::Info => &warn_fg,
+    };
+
+    // Title based on error type
+    let icon = match suggestion.error_type {
+        crate::observer::ErrorType::Compile => " [!] Compile Error ",
+        crate::observer::ErrorType::Runtime => " [!] Runtime Error ",
+        crate::observer::ErrorType::Test => " [!] Test Failure ",
+        crate::observer::ErrorType::Permission => " [!] Permission Error ",
+        crate::observer::ErrorType::NotFound => " [?] Not Found ",
+        crate::observer::ErrorType::Git => " [!] Git Error ",
+        crate::observer::ErrorType::General => " [!] Error ",
+    };
+
+    let title_fill_len = box_w.saturating_sub(icon.len() + 1);
+    let title_fill: String = std::iter::repeat(BOX_H).take(title_fill_len).collect();
+
+    // Position: bottom of the chat area
+    let chat_h = state.chat_bottom().saturating_sub(state.chat_top()) + 1;
+    let overlay_height = 8u16; // total lines including borders
+    let start_row = state.chat_top() + chat_h.saturating_sub(overlay_height);
+    let indent = 4u16;
+    let col = indent;
+
+    let mut out = String::new();
+    out.push_str("\x1b[s"); // save cursor
+    out.push_str(HIDE_CURSOR);
+
+    let mut row = start_row;
+
+    // Top border
+    out.push_str(&goto(row, col));
+    out.push_str(&format!(
+        "{severity_color}{BOX_TL}{BOX_H}{r}{severity_color}{BOLD}{icon}{r}{severity_color}{title_fill}{BOX_TR}{r}",
+    ));
+    row += 1;
+
+    // Error message (truncated to fit)
+    let msg_max = box_w.saturating_sub(4);
+    let msg = truncate(&suggestion.message, msg_max);
+    let msg_pad = box_w.saturating_sub(msg.len() + 2);
+    out.push_str(&goto(row, col));
+    out.push_str(&format!(
+        "{severity_color}{BOX_V}{r}  {fgv}{msg}{r}{}{severity_color}{BOX_V}{r}",
+        " ".repeat(msg_pad),
+    ));
+    row += 1;
+
+    // Blank line
+    let inner_pad: String = " ".repeat(box_w);
+    out.push_str(&goto(row, col));
+    out.push_str(&format!("{severity_color}{BOX_V}{r}{inner_pad}{severity_color}{BOX_V}{r}"));
+    row += 1;
+
+    // Suggested fix
+    let fix_prefix = if suggestion.auto_fixable { "Run: " } else { "Fix: " };
+    let fix_max = box_w.saturating_sub(fix_prefix.len() + 4);
+    let fix_text = truncate(&suggestion.suggested_fix, fix_max);
+    let fix_line = format!("{fix_prefix}{fix_text}");
+    let fix_pad = box_w.saturating_sub(fix_line.len() + 2);
+    out.push_str(&goto(row, col));
+    out.push_str(&format!(
+        "{severity_color}{BOX_V}{r}  {success_fg}{BOLD}{fix_prefix}{r}{fgv}{fix_text}{r}{}{severity_color}{BOX_V}{r}",
+        " ".repeat(fix_pad),
+    ));
+    row += 1;
+
+    // Blank line
+    out.push_str(&goto(row, col));
+    out.push_str(&format!("{severity_color}{BOX_V}{r}{inner_pad}{severity_color}{BOX_V}{r}"));
+    row += 1;
+
+    // Keybinding hints
+    let more = if visible_count > 1 {
+        format!(" ({} more)", visible_count - 1)
+    } else {
+        String::new()
+    };
+    let keys_line = format!(
+        " {key_bg}{key_fg} Enter {r} {muted}Apply   {key_bg}{key_fg} Tab {r} {muted}Next{more}   {key_bg}{key_fg} Esc {r} {muted}Dismiss{r}",
+    );
+    // Calculate visible length for padding
+    let keys_visible_len = 6 + 8 + 4 + 4 + more.len() + 9 + 4 + 7; // approximate
+    let keys_pad = box_w.saturating_sub(keys_visible_len + 1);
+    out.push_str(&goto(row, col));
+    out.push_str(&format!(
+        "{severity_color}{BOX_V}{r}{keys_line}{}{severity_color}{BOX_V}{r}",
+        " ".repeat(keys_pad),
+    ));
+    row += 1;
+
+    // Bottom border
+    out.push_str(&goto(row, col));
+    out.push_str(&format!("{severity_color}{BOX_BL}{hline}{BOX_BR}{r}"));
+
+    // Restore cursor
+    out.push_str(SHOW_CURSOR);
+    out.push_str("\x1b[u");
+
+    out
+}
+
 /// Format a shutdown message.
 pub fn format_shutdown() -> String {
     format!("\r\n{}{ITALIC}Agent session ended.{RESET}\r\n", fgc(MUTED))

@@ -78,18 +78,18 @@ impl ElwoodDomain {
     }
 }
 
-/// Create the LLM provider based on configuration.
+/// Create the LLM provider for a given provider name.
 ///
 /// Tries in order:
-/// 1. Gemini OAuth (from `~/.gemini/oauth_creds.json`)
+/// 1. Gemini OAuth (from `~/.gemini/oauth_creds.json`) if provider is "gemini"
 /// 2. Auto-detect from environment variables
-fn create_provider(
-    config: &crate::config::ElwoodConfig,
+fn create_provider_for(
+    provider_name: &str,
 ) -> anyhow::Result<Arc<dyn elwood_core::provider::LlmProvider>> {
     use elwood_core::provider::{GeminiProvider, ProviderFactory};
 
     // If configured for gemini, try OAuth first
-    if config.provider == "gemini" {
+    if provider_name == "gemini" {
         let cred_path = dirs_next::home_dir()
             .unwrap_or_default()
             .join(".gemini")
@@ -121,72 +121,84 @@ async fn agent_runtime_loop(
 
     let config = crate::config::ElwoodConfig::load();
 
-    // Create provider
-    let provider = match create_provider(&config) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::error!("Failed to create provider: {e}");
-            let _ = response_tx.send(AgentResponse::Error(format!(
-                "Failed to initialize LLM provider: {e}"
-            )));
-            // Still run a degraded loop that reports the error for each request
-            while let Ok(req) = request_rx.recv_async().await {
-                match req {
-                    AgentRequest::Shutdown => {
-                        let _ = response_tx.send(AgentResponse::Shutdown);
-                        break;
+    // Initialize the model router from config
+    let mut model_router = config.model_router();
+
+    // Create provider for the initial active model
+    let mut provider: Arc<dyn elwood_core::provider::LlmProvider> =
+        match create_provider_for(&model_router.active_model().provider) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!("Failed to create provider: {e}");
+                let _ = response_tx.send(AgentResponse::Error(format!(
+                    "Failed to initialize LLM provider: {e}"
+                )));
+                // Still run a degraded loop that reports the error for each request
+                while let Ok(req) = request_rx.recv_async().await {
+                    match req {
+                        AgentRequest::Shutdown => {
+                            let _ = response_tx.send(AgentResponse::Shutdown);
+                            break;
+                        }
+                        AgentRequest::SendMessage { .. } | AgentRequest::Start { .. } => {
+                            let _ = response_tx.send(AgentResponse::Error(format!(
+                                "No LLM provider configured: {e}"
+                            )));
+                            let _ =
+                                response_tx.send(AgentResponse::TurnComplete { summary: None });
+                        }
+                        AgentRequest::RunCommand {
+                            command,
+                            working_dir,
+                        } => {
+                            // Commands still work even without an LLM provider
+                            let tx = response_tx.clone();
+                            tokio::spawn(async move {
+                                let shell = std::env::var("SHELL")
+                                    .unwrap_or_else(|_| "bash".to_string());
+                                let mut cmd = tokio::process::Command::new(&shell);
+                                cmd.arg("-c").arg(&command);
+                                cmd.stdout(std::process::Stdio::piped());
+                                cmd.stderr(std::process::Stdio::piped());
+                                if let Some(ref dir) = working_dir {
+                                    cmd.current_dir(dir);
+                                }
+                                let result = tokio::time::timeout(
+                                    std::time::Duration::from_secs(300),
+                                    cmd.output(),
+                                )
+                                .await;
+                                let response = match result {
+                                    Ok(Ok(output)) => AgentResponse::CommandOutput {
+                                        command: command.clone(),
+                                        stdout: String::from_utf8_lossy(&output.stdout)
+                                            .to_string(),
+                                        stderr: String::from_utf8_lossy(&output.stderr)
+                                            .to_string(),
+                                        exit_code: output.status.code(),
+                                    },
+                                    Ok(Err(e)) => AgentResponse::CommandOutput {
+                                        command: command.clone(),
+                                        stdout: String::new(),
+                                        stderr: format!("Failed to execute: {e}"),
+                                        exit_code: Some(-1),
+                                    },
+                                    Err(_) => AgentResponse::CommandOutput {
+                                        command: command.clone(),
+                                        stdout: String::new(),
+                                        stderr: "Command timed out (5 minute limit)".to_string(),
+                                        exit_code: Some(-1),
+                                    },
+                                };
+                                let _ = tx.send(response);
+                            });
+                        }
+                        _ => {}
                     }
-                    AgentRequest::SendMessage { .. } | AgentRequest::Start { .. } => {
-                        let _ = response_tx.send(AgentResponse::Error(format!(
-                            "No LLM provider configured: {e}"
-                        )));
-                        let _ = response_tx.send(AgentResponse::TurnComplete { summary: None });
-                    }
-                    AgentRequest::RunCommand { command, working_dir } => {
-                        // Commands still work even without an LLM provider
-                        let tx = response_tx.clone();
-                        tokio::spawn(async move {
-                            let shell = std::env::var("SHELL").unwrap_or_else(|_| "bash".to_string());
-                            let mut cmd = tokio::process::Command::new(&shell);
-                            cmd.arg("-c").arg(&command);
-                            cmd.stdout(std::process::Stdio::piped());
-                            cmd.stderr(std::process::Stdio::piped());
-                            if let Some(ref dir) = working_dir {
-                                cmd.current_dir(dir);
-                            }
-                            let result = tokio::time::timeout(
-                                std::time::Duration::from_secs(300),
-                                cmd.output(),
-                            ).await;
-                            let response = match result {
-                                Ok(Ok(output)) => AgentResponse::CommandOutput {
-                                    command: command.clone(),
-                                    stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-                                    stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-                                    exit_code: output.status.code(),
-                                },
-                                Ok(Err(e)) => AgentResponse::CommandOutput {
-                                    command: command.clone(),
-                                    stdout: String::new(),
-                                    stderr: format!("Failed to execute: {e}"),
-                                    exit_code: Some(-1),
-                                },
-                                Err(_) => AgentResponse::CommandOutput {
-                                    command: command.clone(),
-                                    stdout: String::new(),
-                                    stderr: "Command timed out (5 minute limit)".to_string(),
-                                    exit_code: Some(-1),
-                                },
-                            };
-                            let _ = tx.send(response);
-                        });
-                    }
-                    _ => {}
                 }
+                return;
             }
-            return;
-        }
-    };
+        };
 
     // Create tool registry with default permissions
     let mut tools_inner = ToolRegistry::new(PermissionConfig::default());
@@ -216,6 +228,14 @@ async fn agent_runtime_loop(
 
     let tools = Arc::new(tools_inner);
 
+    // Start MCP server if enabled in config
+    let _mcp_server_handle = if config.mcp.server_enabled {
+        tracing::info!("MCP server enabled — starting stdio server");
+        Some(crate::mcp::server::spawn_server(None))
+    } else {
+        None
+    };
+
     // Conversation history persists across turns within a session
     let mut messages: Vec<Message> = Vec::new();
 
@@ -236,9 +256,10 @@ async fn agent_runtime_loop(
     };
 
     tracing::info!(
-        "Elwood agent runtime started (provider={}, model={}, symbols={})",
-        config.provider,
-        config.model,
+        "Elwood agent runtime started (provider={}, model={}, models={}, symbols={})",
+        model_router.active_model().provider,
+        model_router.active_model().name,
+        model_router.model_count(),
         semantic_bridge.as_ref().map(|b| b.symbol_count()).unwrap_or(0),
     );
 
@@ -264,7 +285,7 @@ async fn agent_runtime_loop(
                 messages.push(Message::user(&prompt));
 
                 run_agent_turn(
-                    &config,
+                    &mut model_router,
                     &provider,
                     &tools,
                     &cancel,
@@ -316,7 +337,7 @@ async fn agent_runtime_loop(
                 messages.push(Message::user(&enriched));
 
                 run_agent_turn(
-                    &config,
+                    &mut model_router,
                     &provider,
                     &tools,
                     &cancel,
@@ -391,6 +412,67 @@ async fn agent_runtime_loop(
                 tracing::debug!("PTY request received in agent loop (ignored)");
             }
 
+            AgentRequest::ObservePanes => {
+                // Pane observation is handled on the WezTerm/pane side
+                // (requires Mux access which is only available on the smol thread).
+                tracing::debug!("ObservePanes request received in agent loop (ignored)");
+            }
+
+            AgentRequest::GeneratePlan { description } => {
+                // Plan generation: send as a regular agent turn with a planning prompt
+                cancel = CancellationToken::new();
+                let plan_prompt = format!(
+                    "Please create a detailed step-by-step implementation plan for:\n\n{description}\n\n\
+                     Format your response as a numbered list of steps, each with:\n\
+                     - A clear action title\n\
+                     - Brief description of what to do\n\
+                     - Files to modify (if applicable)"
+                );
+                messages.push(Message::user(&plan_prompt));
+
+                run_agent_turn(
+                    &mut model_router,
+                    &provider,
+                    &tools,
+                    &cancel,
+                    &mut messages,
+                    &response_tx,
+                )
+                .await;
+            }
+
+            AgentRequest::SwitchModel { model_name } => {
+                if model_router.switch_to(&model_name) {
+                    let active = model_router.active_model();
+                    tracing::info!(
+                        "Switched to model: {} (provider={})",
+                        active.name,
+                        active.provider,
+                    );
+
+                    // Create a new provider for the switched model
+                    match create_provider_for(&active.provider) {
+                        Ok(new_provider) => {
+                            provider = new_provider;
+                            let _ = response_tx.send(AgentResponse::ModelSwitched {
+                                model_name: active.name.clone(),
+                            });
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to create provider for {}: {e}", active.provider);
+                            let _ = response_tx.send(AgentResponse::Error(format!(
+                                "Failed to switch to {}: {e}",
+                                model_name,
+                            )));
+                        }
+                    }
+                } else {
+                    let _ = response_tx.send(AgentResponse::Error(format!(
+                        "Unknown model: {model_name}. Use /model list to see available models."
+                    )));
+                }
+            }
+
             AgentRequest::Shutdown => {
                 tracing::info!("Elwood agent runtime shutting down");
                 cancel.cancel();
@@ -405,7 +487,7 @@ async fn agent_runtime_loop(
 
 /// Execute a single agent turn: create a CoreAgent, run execute(), and translate events.
 async fn run_agent_turn(
-    config: &crate::config::ElwoodConfig,
+    model_router: &mut crate::model_router::ModelRouter,
     provider: &Arc<dyn elwood_core::provider::LlmProvider>,
     tools: &Arc<elwood_core::tools::ToolRegistry>,
     cancel: &tokio_util::sync::CancellationToken,
@@ -415,14 +497,16 @@ async fn run_agent_turn(
     use elwood_core::agent::{AgentDef, CoreAgent};
     use elwood_core::output::{AgentEvent, ChannelOutput};
 
+    let active_model = model_router.active_model();
+
     // Create a tokio mpsc channel for AgentEvents
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<AgentEvent>(256);
     let output: Arc<dyn elwood_core::output::AgentOutput> = Arc::new(ChannelOutput::new(event_tx));
 
     let agent_def = AgentDef {
         name: "elwood".to_string(),
-        model: Some(config.model.clone()),
-        provider: Some(config.provider.clone()),
+        model: Some(active_model.name.clone()),
+        provider: Some(active_model.provider.clone()),
         ..AgentDef::default()
     };
 
@@ -546,6 +630,18 @@ fn translate_event(event: elwood_core::output::AgentEvent) -> Option<AgentRespon
             Some(AgentResponse::ContentDelta(format!("[status] {message}\n")))
         }
 
+        // Token/cost tracking — forward to the bridge for model router
+        AgentEvent::TokenUsage { usage, .. } => Some(AgentResponse::CostUpdate {
+            input_tokens: usage.prompt_tokens as u64,
+            output_tokens: usage.completion_tokens as u64,
+            cost_usd: 0.0, // cost computed on the pane side from model pricing
+        }),
+        AgentEvent::CostUpdate { total_cost, .. } => Some(AgentResponse::CostUpdate {
+            input_tokens: 0,
+            output_tokens: 0,
+            cost_usd: total_cost,
+        }),
+
         // Events we don't surface to the terminal
         AgentEvent::SessionStarted { .. }
         | AgentEvent::SessionResumed { .. }
@@ -553,8 +649,6 @@ fn translate_event(event: elwood_core::output::AgentEvent) -> Option<AgentRespon
         | AgentEvent::AgentThinking { .. }
         | AgentEvent::AgentCompleted { .. }
         | AgentEvent::ContentComplete { .. }
-        | AgentEvent::TokenUsage { .. }
-        | AgentEvent::CostUpdate { .. }
         | AgentEvent::SwarmStarted { .. }
         | AgentEvent::SwarmCompleted { .. }
         | AgentEvent::RecoveryAttempt { .. }

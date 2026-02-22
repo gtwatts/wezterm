@@ -11,10 +11,12 @@
 //! | `/help`   | Show available commands                  |
 //! | `/clear`  | Clear chat history                       |
 //! | `/model`  | Show current model info                  |
-//! | `/export` | Export chat as markdown                  |
+//! | `/export` | Export session (md/html/json/share)     |
+//! | `/import` | Import a session file                   |
 //! | `/compact`| Summarize conversation history           |
 //! | `/plan`   | Start plan mode                          |
 //! | `/diff`   | Show git diff of working directory       |
+//! | `/git`    | Git operations (status, stage, commit)  |
 
 use crate::runtime::AgentRequest;
 
@@ -40,8 +42,38 @@ pub enum CommandResult {
     ClearChat,
     /// Export the session to the given path.
     ExportSession(String),
+    /// Export session in a specific format.
+    ExportFormatted {
+        /// Target file path.
+        path: String,
+        /// Format: "md", "html", "json", or "share".
+        format: String,
+    },
+    /// Import a session from a file path.
+    ImportSession {
+        /// Path to the session file.
+        path: String,
+    },
     /// Open the interactive diff viewer.
     OpenDiffViewer { staged: bool },
+    /// Open the interactive staging view (`/git stage`).
+    OpenStagingView,
+    /// Open the commit flow (`/git commit`).
+    OpenCommitFlow,
+    /// Push to remote (`/git push`).
+    GitPush,
+    /// Show git log (`/git log`).
+    GitLog { count: usize },
+    /// Show git status (`/git status`).
+    GitStatus,
+    /// List sibling terminal panes (`/panes`).
+    ListPanes,
+    /// Switch to a named model (`/model <name>`).
+    SwitchModel { model_name: String },
+    /// List saved plans (`/plan list`).
+    ListPlans,
+    /// Resume a saved plan by ID prefix (`/plan resume <id>`).
+    ResumePlan { id_prefix: String },
     /// Unknown or invalid command.
     Unknown(String),
 }
@@ -61,13 +93,18 @@ pub fn get_commands() -> Vec<SlashCommand> {
         },
         SlashCommand {
             name: "model",
-            description: "Show current model info",
-            usage: "/model",
+            description: "Show/switch model (list, <name>)",
+            usage: "/model [list|<name>]",
         },
         SlashCommand {
             name: "export",
-            description: "Export chat as markdown",
-            usage: "/export [path]",
+            description: "Export session (md/html/json/share)",
+            usage: "/export [md|html|json|share] [path]",
+        },
+        SlashCommand {
+            name: "import",
+            description: "Import a session file",
+            usage: "/import <path>",
         },
         SlashCommand {
             name: "compact",
@@ -76,13 +113,23 @@ pub fn get_commands() -> Vec<SlashCommand> {
         },
         SlashCommand {
             name: "plan",
-            description: "Start plan mode",
-            usage: "/plan [goal]",
+            description: "Create/manage implementation plans",
+            usage: "/plan [list|resume <id>|<description>]",
         },
         SlashCommand {
             name: "diff",
             description: "Show interactive diff viewer",
             usage: "/diff [--staged]",
+        },
+        SlashCommand {
+            name: "git",
+            description: "Git operations (status/diff/stage/commit/push/log)",
+            usage: "/git <subcommand>",
+        },
+        SlashCommand {
+            name: "panes",
+            description: "List sibling terminal panes and their content",
+            usage: "/panes",
         },
     ]
 }
@@ -117,11 +164,14 @@ pub fn execute_command(name: &str, args: &str, model_name: &str) -> CommandResul
     match name {
         "help" => execute_help(),
         "clear" => CommandResult::ClearChat,
-        "model" => execute_model(model_name),
+        "model" => execute_model(args, model_name),
         "export" => execute_export(args),
+        "import" => execute_import(args),
         "compact" => execute_compact(),
         "plan" => execute_plan(args),
         "diff" => execute_diff(args),
+        "git" => execute_git(args),
+        "panes" => CommandResult::ListPanes,
         _ => CommandResult::Unknown(name.to_string()),
     }
 }
@@ -147,25 +197,85 @@ fn execute_help() -> CommandResult {
     CommandResult::ChatMessage(msg)
 }
 
-/// `/model` — display current model info.
-fn execute_model(model_name: &str) -> CommandResult {
-    let display = if model_name.is_empty() {
-        "No model configured".to_string()
+/// `/model [list|<name>]` — show current model, list models, or switch.
+fn execute_model(args: &str, model_name: &str) -> CommandResult {
+    let args = args.trim();
+    if args.is_empty() {
+        // No args: show current model
+        let display = if model_name.is_empty() {
+            "No model configured".to_string()
+        } else {
+            format!("Current model: {model_name}")
+        };
+        CommandResult::ChatMessage(display)
+    } else if args == "list" {
+        // `/model list` — show all models (rendered by the pane from the model router)
+        CommandResult::ChatMessage("__MODEL_LIST__".to_string())
     } else {
-        format!("Current model: {model_name}")
-    };
-    CommandResult::ChatMessage(display)
+        // `/model <name>` — switch to named model
+        CommandResult::SwitchModel {
+            model_name: args.to_string(),
+        }
+    }
 }
 
-/// `/export [path]` — export chat session.
+/// `/export [format] [path]` — export chat session in various formats.
+///
+/// Formats: `md` (default), `html`, `json`, `share` (encrypted).
 fn execute_export(args: &str) -> CommandResult {
-    let path = if args.is_empty() {
-        let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
-        format!("elwood_chat_{timestamp}.md")
-    } else {
-        args.to_string()
+    let (format, rest) = match args.split_once(char::is_whitespace) {
+        Some((f, r)) => (f.trim(), r.trim()),
+        None => (args.trim(), ""),
     };
-    CommandResult::ExportSession(path)
+
+    match format {
+        "html" | "json" | "share" => {
+            let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+            let ext = match format {
+                "share" => "elwood-session",
+                other => other,
+            };
+            let path = if rest.is_empty() {
+                format!("elwood_chat_{timestamp}.{ext}")
+            } else {
+                rest.to_string()
+            };
+            CommandResult::ExportFormatted {
+                path,
+                format: format.to_string(),
+            }
+        }
+        "md" => {
+            let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+            let path = if rest.is_empty() {
+                format!("elwood_chat_{timestamp}.md")
+            } else {
+                rest.to_string()
+            };
+            CommandResult::ExportSession(path)
+        }
+        "" => {
+            let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+            CommandResult::ExportSession(format!("elwood_chat_{timestamp}.md"))
+        }
+        _ => {
+            // Treat as a path (backward compat with `/export /tmp/file.md`)
+            CommandResult::ExportSession(args.to_string())
+        }
+    }
+}
+
+/// `/import <path>` — import a session file.
+fn execute_import(args: &str) -> CommandResult {
+    let path = args.trim();
+    if path.is_empty() {
+        return CommandResult::ChatMessage(
+            "Usage: /import <path>\n\nSupported formats: .json, .elwood-session".to_string(),
+        );
+    }
+    CommandResult::ImportSession {
+        path: path.to_string(),
+    }
 }
 
 /// `/compact` — ask the agent to summarize conversation history.
@@ -177,24 +287,84 @@ fn execute_compact() -> CommandResult {
     })
 }
 
-/// `/plan [goal]` — start plan mode (send planning request to agent).
+/// `/plan [list|resume <id>|<description>]` — plan mode with subcommands.
 fn execute_plan(args: &str) -> CommandResult {
-    let prompt = if args.is_empty() {
-        "Please analyze the current state and create a step-by-step plan \
-         for completing the task at hand."
-            .to_string()
-    } else {
-        format!(
-            "Please create a step-by-step plan for the following goal:\n\n{args}"
-        )
+    let (subcmd, sub_args) = match args.split_once(char::is_whitespace) {
+        Some((cmd, rest)) => (cmd, rest.trim()),
+        None => (args, ""),
     };
-    CommandResult::AgentRequest(AgentRequest::SendMessage { content: prompt })
+
+    match subcmd {
+        "list" => CommandResult::ListPlans,
+        "resume" => {
+            if sub_args.is_empty() {
+                CommandResult::ChatMessage(
+                    "Usage: /plan resume <id-prefix>\nUse /plan list to see saved plans."
+                        .to_string(),
+                )
+            } else {
+                CommandResult::ResumePlan {
+                    id_prefix: sub_args.to_string(),
+                }
+            }
+        }
+        "" => {
+            // No args: generate plan for current task
+            CommandResult::AgentRequest(AgentRequest::GeneratePlan {
+                description: "Analyze the current state and create a step-by-step plan \
+                              for completing the task at hand."
+                    .to_string(),
+            })
+        }
+        _ => {
+            // Treat entire args string as the plan description
+            CommandResult::AgentRequest(AgentRequest::GeneratePlan {
+                description: args.to_string(),
+            })
+        }
+    }
 }
 
 /// `/diff [--staged]` — open the interactive diff viewer.
 fn execute_diff(args: &str) -> CommandResult {
     let staged = args.contains("--staged");
     CommandResult::OpenDiffViewer { staged }
+}
+
+/// `/git <subcommand>` — git operations.
+fn execute_git(args: &str) -> CommandResult {
+    let (subcmd, sub_args) = match args.split_once(char::is_whitespace) {
+        Some((cmd, rest)) => (cmd, rest.trim()),
+        None => (args, ""),
+    };
+
+    match subcmd {
+        "status" | "st" => CommandResult::GitStatus,
+        "diff" => {
+            let staged = sub_args.contains("--staged") || sub_args.contains("--cached");
+            CommandResult::OpenDiffViewer { staged }
+        }
+        "stage" | "add" => CommandResult::OpenStagingView,
+        "commit" | "ci" => CommandResult::OpenCommitFlow,
+        "push" => CommandResult::GitPush,
+        "log" => {
+            let count = sub_args.parse::<usize>().unwrap_or(10);
+            CommandResult::GitLog { count }
+        }
+        "" => {
+            let help = "\
+/git status    Show detailed file status\n\
+/git diff      Open interactive diff viewer\n\
+/git stage     Interactive file staging\n\
+/git commit    Stage + AI commit message + commit\n\
+/git push      Push to remote\n\
+/git log [N]   Show recent N commits (default 10)";
+            CommandResult::ChatMessage(help.to_string())
+        }
+        other => CommandResult::ChatMessage(format!(
+            "Unknown git subcommand: {other}\nType /git for available subcommands."
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -272,6 +442,28 @@ mod tests {
     }
 
     #[test]
+    fn test_execute_model_list() {
+        let result = execute_command("model", "list", "gemini-2.5-pro");
+        match result {
+            CommandResult::ChatMessage(msg) => {
+                assert_eq!(msg, "__MODEL_LIST__");
+            }
+            other => panic!("expected ChatMessage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_execute_model_switch() {
+        let result = execute_command("model", "claude-sonnet-4-6", "");
+        match result {
+            CommandResult::SwitchModel { model_name } => {
+                assert_eq!(model_name, "claude-sonnet-4-6");
+            }
+            other => panic!("expected SwitchModel, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_execute_export_default_path() {
         let result = execute_command("export", "", "");
         match result {
@@ -304,10 +496,10 @@ mod tests {
     fn test_execute_plan_no_args() {
         let result = execute_command("plan", "", "");
         match result {
-            CommandResult::AgentRequest(AgentRequest::SendMessage { content }) => {
-                assert!(content.contains("step-by-step plan"));
+            CommandResult::AgentRequest(AgentRequest::GeneratePlan { description }) => {
+                assert!(description.contains("step-by-step plan"));
             }
-            other => panic!("expected AgentRequest::SendMessage, got {other:?}"),
+            other => panic!("expected AgentRequest::GeneratePlan, got {other:?}"),
         }
     }
 
@@ -315,11 +507,34 @@ mod tests {
     fn test_execute_plan_with_args() {
         let result = execute_command("plan", "build a REST API", "");
         match result {
-            CommandResult::AgentRequest(AgentRequest::SendMessage { content }) => {
-                assert!(content.contains("build a REST API"));
+            CommandResult::AgentRequest(AgentRequest::GeneratePlan { description }) => {
+                assert!(description.contains("build a REST API"));
             }
-            other => panic!("expected AgentRequest::SendMessage, got {other:?}"),
+            other => panic!("expected AgentRequest::GeneratePlan, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_execute_plan_list() {
+        let result = execute_command("plan", "list", "");
+        assert!(matches!(result, CommandResult::ListPlans));
+    }
+
+    #[test]
+    fn test_execute_plan_resume() {
+        let result = execute_command("plan", "resume 20260222", "");
+        match result {
+            CommandResult::ResumePlan { id_prefix } => {
+                assert_eq!(id_prefix, "20260222");
+            }
+            other => panic!("expected ResumePlan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_execute_plan_resume_no_id() {
+        let result = execute_command("plan", "resume", "");
+        assert!(matches!(result, CommandResult::ChatMessage(_)));
     }
 
     #[test]
@@ -342,7 +557,7 @@ mod tests {
         assert_eq!(matches[0].name, "clear");
 
         let matches = complete_command("");
-        assert_eq!(matches.len(), 7); // all commands
+        assert_eq!(matches.len(), 10); // all commands
     }
 
     #[test]
@@ -362,6 +577,7 @@ mod tests {
         assert!(names.contains(&"compact"));
         assert!(names.contains(&"plan"));
         assert!(names.contains(&"diff"));
+        assert!(names.contains(&"git"));
     }
 
     #[test]
@@ -374,5 +590,177 @@ mod tests {
     fn test_execute_diff_staged() {
         let result = execute_command("diff", "--staged", "");
         assert!(matches!(result, CommandResult::OpenDiffViewer { staged: true }));
+    }
+
+    #[test]
+    fn test_execute_git_status() {
+        let result = execute_command("git", "status", "");
+        assert!(matches!(result, CommandResult::GitStatus));
+    }
+
+    #[test]
+    fn test_execute_git_status_alias() {
+        let result = execute_command("git", "st", "");
+        assert!(matches!(result, CommandResult::GitStatus));
+    }
+
+    #[test]
+    fn test_execute_git_stage() {
+        let result = execute_command("git", "stage", "");
+        assert!(matches!(result, CommandResult::OpenStagingView));
+    }
+
+    #[test]
+    fn test_execute_git_add_alias() {
+        let result = execute_command("git", "add", "");
+        assert!(matches!(result, CommandResult::OpenStagingView));
+    }
+
+    #[test]
+    fn test_execute_git_commit() {
+        let result = execute_command("git", "commit", "");
+        assert!(matches!(result, CommandResult::OpenCommitFlow));
+    }
+
+    #[test]
+    fn test_execute_git_push() {
+        let result = execute_command("git", "push", "");
+        assert!(matches!(result, CommandResult::GitPush));
+    }
+
+    #[test]
+    fn test_execute_git_log_default() {
+        let result = execute_command("git", "log", "");
+        assert!(matches!(result, CommandResult::GitLog { count: 10 }));
+    }
+
+    #[test]
+    fn test_execute_git_log_with_count() {
+        let result = execute_command("git", "log 5", "");
+        assert!(matches!(result, CommandResult::GitLog { count: 5 }));
+    }
+
+    #[test]
+    fn test_execute_git_diff() {
+        let result = execute_command("git", "diff", "");
+        assert!(matches!(result, CommandResult::OpenDiffViewer { staged: false }));
+    }
+
+    #[test]
+    fn test_execute_git_diff_staged() {
+        let result = execute_command("git", "diff --staged", "");
+        assert!(matches!(result, CommandResult::OpenDiffViewer { staged: true }));
+    }
+
+    #[test]
+    fn test_execute_git_no_subcommand() {
+        let result = execute_command("git", "", "");
+        match result {
+            CommandResult::ChatMessage(msg) => {
+                assert!(msg.contains("/git status"));
+                assert!(msg.contains("/git commit"));
+                assert!(msg.contains("/git push"));
+            }
+            other => panic!("expected ChatMessage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_execute_git_unknown_subcommand() {
+        let result = execute_command("git", "rebase", "");
+        match result {
+            CommandResult::ChatMessage(msg) => {
+                assert!(msg.contains("Unknown git subcommand: rebase"));
+            }
+            other => panic!("expected ChatMessage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_execute_export_html() {
+        let result = execute_command("export", "html", "");
+        match result {
+            CommandResult::ExportFormatted { path, format } => {
+                assert!(path.ends_with(".html"));
+                assert_eq!(format, "html");
+            }
+            other => panic!("expected ExportFormatted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_execute_export_json() {
+        let result = execute_command("export", "json", "");
+        match result {
+            CommandResult::ExportFormatted { path, format } => {
+                assert!(path.ends_with(".json"));
+                assert_eq!(format, "json");
+            }
+            other => panic!("expected ExportFormatted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_execute_export_share() {
+        let result = execute_command("export", "share", "");
+        match result {
+            CommandResult::ExportFormatted { path, format } => {
+                assert!(path.ends_with(".elwood-session"));
+                assert_eq!(format, "share");
+            }
+            other => panic!("expected ExportFormatted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_execute_export_html_with_path() {
+        let result = execute_command("export", "html /tmp/session.html", "");
+        match result {
+            CommandResult::ExportFormatted { path, format } => {
+                assert_eq!(path, "/tmp/session.html");
+                assert_eq!(format, "html");
+            }
+            other => panic!("expected ExportFormatted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_execute_export_md_explicit() {
+        let result = execute_command("export", "md", "");
+        match result {
+            CommandResult::ExportSession(path) => {
+                assert!(path.ends_with(".md"));
+            }
+            other => panic!("expected ExportSession, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_execute_import_with_path() {
+        let result = execute_command("import", "/tmp/session.json", "");
+        match result {
+            CommandResult::ImportSession { path } => {
+                assert_eq!(path, "/tmp/session.json");
+            }
+            other => panic!("expected ImportSession, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_execute_import_no_args() {
+        let result = execute_command("import", "", "");
+        match result {
+            CommandResult::ChatMessage(msg) => {
+                assert!(msg.contains("Usage: /import"));
+            }
+            other => panic!("expected ChatMessage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_get_commands_has_import() {
+        let commands = get_commands();
+        let names: Vec<&str> = commands.iter().map(|c| c.name).collect();
+        assert!(names.contains(&"import"));
     }
 }

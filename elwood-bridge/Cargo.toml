@@ -26,6 +26,9 @@ tokio = { workspace = true, features = ["rt-multi-thread", "sync", "macros"] }
 tokio-util = { workspace = true }
 tracing = "0.1"
 
+# Lua scripting for plugin hooks
+mlua = { workspace = true, features = ["vendored", "lua54", "send", "serialize"] }
+
 # Elwood core (path dep — outside this workspace)
 elwood-core = { path = "../../../elwood-core" }
 
@@ -51,6 +54,10 @@ ignore = "0.4"
 
 # Diff engine for code review
 similar = { version = "2", features = ["inline", "unicode"] }
+
+# Session export: encryption + compression
+sha2.workspace = true
+flate2 = "1"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "macros", "test-util"] }

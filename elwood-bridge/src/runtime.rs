@@ -74,6 +74,15 @@ pub enum AgentRequest {
     /// Agent requests a screen snapshot from the PTY.
     PtyReadScreen,
 
+    /// Agent requests to see content from other terminal panes.
+    ObservePanes,
+
+    /// Switch the active model to the named model.
+    SwitchModel { model_name: String },
+
+    /// Generate a structured implementation plan for the given description.
+    GeneratePlan { description: String },
+
     /// Gracefully shut down the agent runtime.
     Shutdown,
 }
@@ -141,11 +150,48 @@ pub enum AgentResponse {
         alt_screen: bool,
     },
 
+    /// Snapshots of content from sibling terminal panes.
+    PaneSnapshots {
+        /// Serialized pane snapshots: (pane_id, title, lines, dimensions).
+        snapshots: Vec<PaneSnapshotInfo>,
+    },
+
+    /// The active model was switched.
+    ModelSwitched { model_name: String },
+
+    /// Agent generated a structured implementation plan.
+    PlanGenerated {
+        /// The raw markdown plan text from the LLM.
+        plan_markdown: String,
+    },
+
+    /// Cumulative cost update (sent after each agent turn).
+    CostUpdate {
+        input_tokens: u64,
+        output_tokens: u64,
+        cost_usd: f64,
+    },
+
     /// An error occurred in the agent.
     Error(String),
 
     /// Agent runtime is shutting down.
     Shutdown,
+}
+
+/// Serializable summary of a pane snapshot for the bridge protocol.
+#[derive(Debug, Clone)]
+pub struct PaneSnapshotInfo {
+    /// The WezTerm pane ID.
+    pub pane_id: usize,
+    /// The pane's title.
+    pub title: String,
+    /// The visible text lines.
+    pub lines: Vec<String>,
+    /// Terminal dimensions (cols, rows).
+    pub dimensions: (usize, usize),
+    /// Cursor row position.
+    pub cursor_row: i64,
 }
 
 /// Bridges the WezTerm (smol) and elwood-core (tokio) async runtimes.
