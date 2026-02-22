@@ -7,7 +7,7 @@
 //! ## File Search
 //!
 //! Uses the `ignore` crate (same as ripgrep) for fast, `.gitignore`-aware
-//! file walking. Files larger than [`MAX_FILE_SIZE`] are skipped.
+//! file walking. Files larger than `MAX_FILE_SIZE` are skipped.
 //!
 //! ## Usage
 //!
@@ -38,7 +38,7 @@ pub struct ContextAttachment {
 
 /// Search for files matching `query` under `cwd`, respecting `.gitignore`.
 ///
-/// Returns up to [`MAX_SEARCH_RESULTS`] matching paths, sorted by relevance
+/// Returns up to `MAX_SEARCH_RESULTS` matching paths, sorted by relevance
 /// (exact basename match first, then prefix match, then substring).
 pub fn search_files(query: &str, cwd: &Path) -> Vec<PathBuf> {
     if query.is_empty() {

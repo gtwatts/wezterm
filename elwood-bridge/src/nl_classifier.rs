@@ -158,7 +158,7 @@ impl NlClassifier {
     /// Classify an input string as natural language or shell command.
     ///
     /// Returns a [`Classification`] with the detected mode and confidence.
-    /// When confidence is below [`AUTO_DETECT_THRESHOLD`], the result is uncertain.
+    /// When confidence is below `AUTO_DETECT_THRESHOLD`, the result is uncertain.
     pub fn classify(&self, input: &str) -> Classification {
         let trimmed = input.trim();
         if trimmed.is_empty() {

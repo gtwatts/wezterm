@@ -464,7 +464,7 @@ fn normalize_command(cmd: &str) -> String {
 /// Next-command prediction engine combining rule, history, and LLM sources.
 ///
 /// Predictions are returned immediately from rules/history. LLM predictions
-/// arrive asynchronously and can be polled via [`take_llm_prediction`].
+/// arrive asynchronously and can be polled via `take_llm_prediction`.
 pub struct PredictionEngine {
     rule_predictor: RulePredictor,
     history_predictor: HistoryPredictor,

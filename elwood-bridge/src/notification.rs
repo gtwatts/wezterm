@@ -120,7 +120,7 @@ const MAX_VISIBLE: usize = 3;
 /// Manages a queue of toast notifications.
 ///
 /// Toasts are added to a queue and rendered from the front. Expired toasts
-/// are automatically removed on each `tick()`. At most [`MAX_VISIBLE`]
+/// are automatically removed on each `tick()`. At most `MAX_VISIBLE`
 /// toasts are shown at any time; the rest are queued.
 pub struct ToastManager {
     toasts: VecDeque<Toast>,

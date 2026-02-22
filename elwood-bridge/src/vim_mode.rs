@@ -1,7 +1,7 @@
 //! Vim modal editing for the Elwood input editor.
 //!
 //! Implements a vim-like editing experience with Normal, Insert, Visual, and
-//! Command modes. Designed to integrate with [`InputEditor`] — when enabled,
+//! Command modes. Designed to integrate with [`crate::editor::InputEditor`] — when enabled,
 //! key events are routed through [`VimMode`] which returns [`VimAction`] values
 //! that the editor applies to its buffer.
 //!

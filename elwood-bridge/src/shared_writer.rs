@@ -20,8 +20,8 @@ use std::sync::Arc;
 
 /// A `Write` implementation backed by a swappable inner writer.
 ///
-/// Created with `io::sink()` as the initial destination. Call [`swap`] to
-/// redirect writes to a PTY master writer, and [`swap_to_sink`] to reset.
+/// Created with `io::sink()` as the initial destination. Call [`Self::swap`] to
+/// redirect writes to a PTY master writer, and [`Self::swap_to_sink`] to reset.
 ///
 /// # Clone
 ///

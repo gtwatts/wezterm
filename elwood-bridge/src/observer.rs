@@ -528,7 +528,7 @@ impl ContentDetector {
 
     /// Analyze lines of terminal output and return structured error detections.
     ///
-    /// Unlike [`detect`], this method returns [`ErrorDetection`] structs with
+    /// Unlike [`Self::detect`], this method returns [`ErrorDetection`] structs with
     /// error type classification, severity, and suggested fixes.
     pub fn detect_errors(&self, lines: &[String]) -> Vec<ErrorDetection> {
         let mut results = Vec::new();

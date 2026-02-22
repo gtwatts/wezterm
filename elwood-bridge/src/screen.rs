@@ -1247,7 +1247,7 @@ pub fn render_shortcut_overlay(state: &ScreenState) -> String {
 
 /// Render a suggestion overlay box in the chat area.
 ///
-/// Displays the active suggestion from the [`SuggestionManager`] as an
+/// Displays the active suggestion from the [`crate::suggestion_overlay::SuggestionManager`] as an
 /// absolute-positioned overlay at the bottom of the chat area. Shows the
 /// error message, suggested fix, and keybinding hints.
 ///
